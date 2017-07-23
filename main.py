@@ -7,14 +7,14 @@ from utils.models import *
 __author__ = 'Jonathan Kyl'
 
 class TextGen(BaseModel):
-    def __init__(self):
+    def __init__(self, length=128, chars=256):
         ''''''
         with tf.variable_scope('CNN'):
-            self.phi = cnn(kind='xception', include_top=False, weights=None)
+            self.phi = cnn(kind='mobilenet', include_top=False, weights=None)
             self.c_dim = self.phi.output_shape[-1]
 
         with tf.variable_scope('LSTM'):
-            self.lstm = lstm_decoder(self.c_dim, length=128, chars=128)
+            self.lstm = lstm_decoder(self.c_dim, length=length, chars=chars)
 
         super(BaseModel, self).__init__(
             self.phi.inputs + self.lstm.inputs,
@@ -41,9 +41,9 @@ class TextGen(BaseModel):
 
             y_hat = self.forward_pass(self, x)
             L = tf.reduce_mean((y_hat - y)**2)
-            lr = 0.0001 * 0.5**tf.floor(
+            lr = lr_init * 0.5**tf.floor(
                 tf.cast(step, tf.float32) / decay_every)
-            opt = tf.train.AdamOptimizer(GAN_lr, beta1=0, beta2=0.9)\
+            opt = tf.train.AdamOptimizer(lr, beta1=0, beta2=0.9)\
                 .minimize(L, var_list=self.trainable_variables)
             
         with tf.variable_scope('Summary'):

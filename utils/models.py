@@ -4,7 +4,7 @@ import numpy as np
 import tensorflow as tf
 import image_queuing as iq
 from seq2seq.models import Seq2Seq
-from tensorflow.contrib.keras import layers, models, applications
+from keras import layers, models, applications, backend
 from tensorflow.contrib.staging import StagingArea
 
 __author__ = 'Jonathan Kyl'
@@ -316,10 +316,10 @@ def seq2seq(n_chars, length, code_dim, depth=4):
     return Seq2Seq(input_dim=n_chars, hidden_dim=code_dim, output_dim=n_chars,
                    input_length=length, output_length=length, depth=depth)
 
-def lstm_decoder(code_dim, length, chars):
-    inp = layers.Input(shape=(code_dim,))
+def lstm_decoder(code_dim, length, chars, activation='linear'):#lambda x: layers.LeakyReLU()(x)):
+    inp = layers.Input(shape=(code_dim,), name='lstm_input')
     rep = layers.RepeatVector(length)(inp)
-    out = layers.LSTM(chars, return_sequences=True)(rep)
+    out = layers.LSTM(chars, return_sequences=True, activation=activation)(rep)
     return models.Model(inp, out)
 
 def mlp(dims, activation='relu'):
@@ -331,10 +331,10 @@ def mlp(dims, activation='relu'):
 def cnn(kind='Xception', classes=None, weights=None, include_top=False, pooling='max'):
     ''''''
     if kind == 'xception':
-        return applications.xception.Xception(classes=classes, pooling=pooling,
+        return applications.Xception(classes=classes, pooling=pooling,
             include_top=include_top, weights=weights)
     elif kind == 'mobilenet':
-        return applications.mobilenet.MobileNet(classes=classes, pooling=pooling,
+        return applications.MobileNet(classes=classes, pooling=pooling,
             include_top=include_top, weights=weights)
 
 def variational_encoder(size, channels, depth, code_dim=64, n_blocks=4,
