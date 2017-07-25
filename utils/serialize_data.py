@@ -6,19 +6,11 @@ import json
 import tqdm
 import os
 
-def crop_to_aspect_ratio(img, aspect_ratio=1.):
+def crop_to_aspect_ratio(img):
     ''''''
     shape = tf.shape(img)
-    H, W = shape[0], shape[1]
-    W = tf.cond(
-            tf.equal(H, tf.minimum(H, W)),
-            lambda: tf.cast(tf.cast(H, tf.float32)*aspect_ratio, tf.int32), 
-            lambda: W)
-    H = tf.cond(
-            tf.equal(W, tf.minimum(H, W)),
-            lambda: tf.cast(tf.cast(W, tf.float32)/aspect_ratio, tf.int32), 
-            lambda: H)
-    return tf.image.resize_image_with_crop_or_pad(img, H, W)
+    X = tf.minimum(shape[0], shape[1])
+    return tf.image.resize_image_with_crop_or_pad(img, X, X)
 
 def resize_lanczos(img, target_shape):
     def rs(x):
@@ -41,7 +33,7 @@ def read_imgs(img_files, size=256, center_crop=True):
     _, img_bytes = reader.read(t_files)
     img = tf.image.decode_jpeg(img_bytes)
     if center_crop:
-        img = crop_to_aspect_ratio(img, 1.)
+        img = crop_to_aspect_ratio(img)
     rs = resize_lanczos(img, (size, size))
     img_bytes = tf.image.encode_jpeg(rs)
     return img_bytes
@@ -50,7 +42,7 @@ def read_captions(captions_json):
     j = json.loads(open(captions_json).read())
     _, captions = zip(*sorted(j.items()))
     captions = np.array(captions)
-    return tf.train.input_producer(captions, shuffle=False).dequeue()
+    return tf.train.input_producer(captions, shuffle=False).dequeue(), captions.max()+1, captions.shape[-1]
 
 def read_classes(classes_json):
     j = json.loads(open(classes_json).read())
@@ -68,7 +60,7 @@ def main(imgs_path, captions_json, classes_json, output_tfrecord,
     print('made coord')
     img_op = read_imgs(img_files)
     print('got img tensor')
-    caption_op = read_captions(captions_json)
+    caption_op, vocab_size, length = read_captions(captions_json)
     print('got captions')
     class_op = read_classes(classes_json)
     print('got classes')
@@ -80,6 +72,9 @@ def main(imgs_path, captions_json, classes_json, output_tfrecord,
             for _ in tqdm.trange(n):
                 img, caption, class_ = sess.run([img_op, caption_op, class_op])
                 example = tf.train.Example(features=tf.train.Features(feature={
+                    'image_size': _int64_feature(img_size),
+                    'vocab_size': _int64_feature(vocab_size),
+                    'length': _int64_feature(length),
                     'image': _bytes_feature(img),
                     'caption': _bytes_feature(caption.tostring()),
                     'class': _int64_feature(class_)

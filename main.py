@@ -1,20 +1,29 @@
 from __future__ import print_function, division
 import os
 import tqdm
+import numpy as np
 import tensorflow as tf
 from utils.models import *
 
 __author__ = 'Jonathan Kyl'
 
 class TextGen(BaseModel):
-    def __init__(self, length=128, chars=256):
+    def __init__(self, img_size=256, code_dim=128, length=20, words=9509):
         ''''''
+        self.img_size = img_size
+        self.length = length
+        self.words = words
+        self.code_dim = code_dim
+        
         with tf.variable_scope('CNN'):
             self.phi = cnn(kind='mobilenet', include_top=False, weights=None)
-            self.c_dim = self.phi.output_shape[-1]
+            self.phi_dim = self.phi.output_shape[-1]
 
         with tf.variable_scope('LSTM'):
-            self.lstm = lstm_decoder(self.c_dim, length=length, chars=chars)
+            self.lstm = lstm_decoder(input_dim=self.phi_dim, 
+                                     length=length, 
+                                     code_dim=code_dim,
+                                     output_dim=words)
 
         super(BaseModel, self).__init__(
             self.phi.inputs + self.lstm.inputs,
@@ -24,51 +33,74 @@ class TextGen(BaseModel):
         ''''''
         return self.lstm(self.phi(x))
 
-    def train(self, train_record, val_record, output_path):
-        ''''''        
+    def train(self, 
+              train_record, 
+              val_record,
+              output_path,
+              batch_size=16, 
+              lr_init=1e-4, 
+              n_read_threads=4,
+              n_stage_threads=2,
+              capacity=16,
+              epoch_size=100,
+              validate_every=100,
+              save_every=1000,
+              decay_every=np.inf, 
+              ckpt=None):
+        '''''' 
+        backend.set_learning_phase(True)
+        
+        with tf.variable_scope('BatchReader'):
+            print('creating batch reader')
+            
+            coord =  tf.train.Coordinator()
+            x_train, y_train, _ = self.read_tfrecord(train_record, 
+                batch_size=batch_size, capacity=capacity, n_threads=n_read_threads)
+            x_train = self.preproc_img(x_train)
+            y_train = self.preproc_caption(y_train)
+        
         with tf.variable_scope('StagingArea'):
             print('creating staging area')
 
-            coord =  tf.train.Coordinator()
-            train_batch = self.read_data(train_record)
-            get, SA_size, put_op = self.stage_data(train_batch)
-            x_train, y_train, _ = get
+            get, SA_size, put_op = self.stage_data(
+                [x_train, y_train], capacity=capacity)
+            x_train, y_train = get
             step = tf.Variable(0, name='step')
             update_step = tf.assign_add(step, 1)
-                        
+
         with tf.variable_scope('Optimizer'):
             print('creating optimizer')
 
-            y_hat = self.forward_pass(self, x)
-            L = tf.reduce_mean((y_hat - y)**2)
+            y_hat = self.forward_pass(x_train)
+            L = tf.reduce_mean(losses.categorical_crossentropy(
+                    y_train, y_hat))
             lr = lr_init * 0.5**tf.floor(
                 tf.cast(step, tf.float32) / decay_every)
-            opt = tf.train.AdamOptimizer(lr, beta1=0, beta2=0.9)\
-                .minimize(L, var_list=self.trainable_variables)
-            
+            opt = tf.train.AdamOptimizer(lr, beta1=0.8, beta2=0.999)\
+                .minimize(L, var_list=self.trainable_weights)
+
         with tf.variable_scope('Summary'):
             print('creating summary')
 
-            x_val, y_val, _ = self.read_data(val_record)
+            x_val, y_val, _ = self.read_tfrecord(val_record, 
+                batch_size=batch_size, n_threads=1)
+            x_val = self.preproc_img(x_val)
+            y_val = self.preproc_caption(y_val)
             y_hat_val = self.forward_pass(x_val)
-            sx = tf.Variable(x_val, name='sample_x')
-            sy = tf.Variable(y_val, name='sample_y')
-            sy_hat = self.lstm(self.phi(sx))
-            L_val = tf.reduce_mean((y_hat_val, y_val)**2)
-            img_dict = {'x': self.postproc_img(sx)}
+            L_val = tf.reduce_mean(losses.categorical_crossentropy(
+                        y_val, y_hat_val))
             scalar_dict = {'train_loss': L, 'val_loss': L_val, 'SA_size': SA_size}
-            text_dict = {'y': sy, 'y_hat': sy_hat}
         summary_op, summary_writer = self.make_summary(
-            output_path, img_dict, scalar_dict, text_dict)
-        
-        with tf.Session() as sess:
+            output_path, img_dict={}, scalar_dict=scalar_dict, text_dict={})
+
+        with tf.Session(graph=self.graph) as sess:
             print('starting threads')
             stage_stop, stage_threads = self.start_threads(
-                sess, coord, put_op, n_stage_threads=4)
+                sess, coord, put_op, n_stage_threads=n_stage_threads)
             print('initializing variables')
             sess.run(tf.global_variables_initializer())
             print('saving weights')
-            self.save_h5(output_path, 0, ae=True)
+            self.save_h5(output_path, 0)
             if ckpt: 
                 print('loading weights from '+ckpt)
                 self.load_weights(ckpt)
@@ -81,19 +113,15 @@ class TextGen(BaseModel):
                     for _ in tqdm.trange(epoch_size, disable=False):
                         if not (coord.should_stop() or stage_stop.is_set()):
 
-                            # evaluate a training step
                             _, n = sess.run([opt, update_step])
-                            
-                            # write image and scalar summaries to disk
-                            if n % summary_every == 1:
+
+                            if n % validate_every == 1:
                                 s = sess.run(summary_op)
                                 summary_writer.add_summary(s, n)
                                 summary_writer.flush()
-                                
-                            # save weights,  style
-                            if n % ckpt_every == 0:
+
+                            if n % save_every == 0:
                                 self.save_h5(output_path, n)
-                                
                     epoch += 1
             except:
                 coord.request_stop()
