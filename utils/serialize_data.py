@@ -9,6 +9,7 @@ import os
 def crop_to_aspect_ratio(img):
     ''''''
     shape = tf.shape(img)
+    print(shape)
     X = tf.minimum(shape[0], shape[1])
     return tf.image.resize_image_with_crop_or_pad(img, X, X)
 
@@ -27,7 +28,7 @@ def _bytes_feature(value):
     return tf.train.Feature(
         bytes_list=tf.train.BytesList(value=[value]))
 
-def read_imgs(img_files, size=256, center_crop=True):
+def read_imgs(img_files, size=224, center_crop=True):
     t_files = tf.train.string_input_producer(img_files, shuffle=False)
     reader = tf.WholeFileReader()
     _, img_bytes = reader.read(t_files)
@@ -40,25 +41,27 @@ def read_imgs(img_files, size=256, center_crop=True):
     
 def read_captions(captions_json):
     j = json.loads(open(captions_json).read())
-    _, captions = zip(*sorted(j.items()))
+    _, captions = zip(*sorted(j.items(), key=lambda x: int(x[0])))
     captions = np.array(captions)
     return tf.train.input_producer(captions, shuffle=False).dequeue(), captions.max()+1, captions.shape[-1]
 
 def read_classes(classes_json):
     j = json.loads(open(classes_json).read())
     d = {d['image_id']: d['category_id'] for d in j['annotations']}
-    _, classes = zip(*sorted(d.items()))
+    _, classes = zip(*sorted(d.items(), key=lambda x: int(x[0])))
     return tf.train.input_producer(classes, shuffle=False).dequeue()
 
 def main(imgs_path, captions_json, classes_json, output_tfrecord,
-         img_size=256, center_crop=True):
+         img_size=224, center_crop=True, truncate=False):
     ''''''
     img_files = sorted(glob.glob(os.path.join(imgs_path, '*.jpg')))
+    if truncate:
+        img_files = img_files[:truncate]
     n = len(img_files)
     print('found {} images'.format(n))
     coord = tf.train.Coordinator()
     print('made coord')
-    img_op = read_imgs(img_files)
+    img_op = read_imgs(img_files, size=img_size, center_crop=center_crop)
     print('got img tensor')
     caption_op, vocab_size, length = read_captions(captions_json)
     print('got captions')
@@ -71,6 +74,7 @@ def main(imgs_path, captions_json, classes_json, output_tfrecord,
         try:
             for _ in tqdm.trange(n):
                 img, caption, class_ = sess.run([img_op, caption_op, class_op])
+                #return img, caption
                 example = tf.train.Example(features=tf.train.Features(feature={
                     'image_size': _int64_feature(img_size),
                     'vocab_size': _int64_feature(vocab_size),
@@ -92,10 +96,12 @@ if __name__== '__main__':
     p.add_argument('captions_json', type=str)
     p.add_argument('classes_json', type=str)
     p.add_argument('output_tfrecord', type=str)
-    p.add_argument('-s', '--img_size', type=int, default=256,
+    p.add_argument('-s', '--img_size', type=int, default=224,
         help='sidelength of images')
     p.add_argument('-c', '--center_crop', type=bool, default=True,
         help='whether or not to perform a center crop before resize')
+    p.add_argument('-t', '--truncate', type=int, default=False,
+        help='whether to truncate the total number of examples')
     d = p.parse_args().__dict__
     main(**d)
         

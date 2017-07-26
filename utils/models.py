@@ -1,11 +1,11 @@
 from __future__ import division, print_function
 import os
+import json
 import threading
 import numpy as np
 import tensorflow as tf
 import image_queuing as iq
 from mobilenet import *
-#from keras import applications
 from tensorflow.contrib.keras import layers, models, backend, applications, losses
 from tensorflow.contrib.staging import StagingArea
 
@@ -80,7 +80,7 @@ class BaseModel(models.Model):
             summaries.append(tf.summary.scalar(k, v))
         for k, v in text_dict.items():
             summaries.append(tf.summary.text(k, v))
-        summary_op = tf.summary.merge_all()
+        summary_op = tf.summary.merge(summaries)
         summary_writer = tf.summary.FileWriter(
             output_path, graph=self.graph)
         return summary_op, summary_writer
@@ -96,8 +96,8 @@ class BaseModel(models.Model):
     def preproc_img(self, img):
         ''''''
         img = tf.cast(img, tf.float32)
+        img -= 127.5
         img /= 127.5
-        img -= 1
         return img
 
     def postproc_img(self, img):
@@ -109,24 +109,43 @@ class BaseModel(models.Model):
     
     def preproc_caption(self, caption):
         ''''''
-        def per_batch(cap):
+        def per_batch_inds(cap, minus_ones=False):
             start = cap[:, 1]
             good = tf.where(tf.greater(start, -1))
             rand = good[tf.random_uniform(minval=0, maxval=tf.shape(good)[0], 
                                           shape=[], dtype=tf.int32)]
             cap = cap[tf.squeeze(rand)]
+            if not minus_ones:
+                return tf.where(tf.less(cap, 0), (self.words-1)*tf.ones_like(cap), cap)
+            return cap
+        
+        def per_batch_onehots(cap):
+            cap = per_batch_inds(cap, minus_ones=True)
             nonpad = tf.squeeze(tf.where(tf.greater(cap, -1)))
-            cap = tf.gather(cap, nonpad)
+            cap_nonpad = tf.gather(cap, nonpad)
             eye = tf.eye(self.words, dtype=tf.float32)
-            onehot = tf.gather(eye, cap)
+            onehot = tf.gather(eye, cap_nonpad)
             padded = tf.pad(onehot, [[0, self.length-tf.shape(onehot)[0]], [0, 0]], 
                             mode='CONSTANT', constant_values=0)
             return padded
-        mapped = tf.map_fn(per_batch, caption, dtype=tf.float32)
-        mapped.set_shape((None, self.length, self.words))
-        #mapped = tf.cast(mapped, tf.float32)
-        return mapped
         
+        inds_mapped = tf.map_fn(per_batch_inds, caption, dtype=tf.int64)
+        onehots_mapped = tf.map_fn(per_batch_onehots, caption, dtype=tf.float32)
+        
+        inds_mapped.set_shape((None, self.length))
+        onehots_mapped.set_shape((None, self.length, self.words))
+        
+        return onehots_mapped, inds_mapped
+    
+def create_table(inds_to_words_json):
+    return tf.Variable(zip(*sorted(json.loads(open(inds_to_words_json)\
+        .read()).items(), key=lambda x: int(x[0])))[1])
+    
+def postproc_caption(caption, table):
+    captions = tf.unstack(caption)
+    strings = tf.gather(table, caption)
+    return tf.reduce_join(strings, axis=[1], separator=' ')
+
 def SELU(x):
     ''''''
     alpha = 1.6732632423543772848170429916717
@@ -134,7 +153,7 @@ def SELU(x):
     return scale * layers.ELU(alpha=alpha)(x)
 
 def lstm_decoder(input_dim, length, code_dim, output_dim, 
-                 activation='softmax'):#lambda x: layers.LeakyReLU()(x)):
+                 activation='softmax'):
     inp = layers.Input(shape=(input_dim,), name='lstm_input')
     def repeat_timedim(x):
         x = tf.expand_dims(x, 1)

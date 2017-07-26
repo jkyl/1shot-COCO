@@ -8,7 +8,7 @@ from utils.models import *
 __author__ = 'Jonathan Kyl'
 
 class TextGen(BaseModel):
-    def __init__(self, img_size=256, code_dim=128, length=20, words=9509):
+    def __init__(self, img_size=224, code_dim=128, length=20, words=9509):
         ''''''
         self.img_size = img_size
         self.length = length
@@ -23,7 +23,8 @@ class TextGen(BaseModel):
             self.lstm = lstm_decoder(input_dim=self.phi_dim, 
                                      length=length, 
                                      code_dim=code_dim,
-                                     output_dim=words)
+                                     output_dim=words, 
+                                     activation='softmax')
 
         super(BaseModel, self).__init__(
             self.phi.inputs + self.lstm.inputs,
@@ -32,6 +33,20 @@ class TextGen(BaseModel):
     def forward_pass(self, x):
         ''''''
         return self.lstm(self.phi(x))
+    
+    def xent_loss(self, x, y):
+        ''''''
+        return tf.reduce_mean(losses.categorical_crossentropy(
+                    y, self.forward_pass(x)))
+    
+    def grad_loss(self, L, w):
+        grads = tf.gradients(L, w)
+        n_params = tf.reduce_sum([tf.cast(tf.reduce_prod(v.shape), tf.float32) for v in w])
+        sum_of_squared = tf.reduce_sum([tf.reduce_sum(g**2) for g in grads])
+        return sum_of_squared / n_params
+    
+    def l2_loss(self, x):
+        return tf.reduce_mean(self.phi(x)**2)
 
     def train(self, 
               train_record, 
@@ -39,13 +54,16 @@ class TextGen(BaseModel):
               output_path,
               batch_size=16, 
               lr_init=1e-4, 
+              lambda_Lg=0,
+              lambda_L2=0,
               n_read_threads=4,
               n_stage_threads=2,
               capacity=16,
               epoch_size=100,
               validate_every=100,
               save_every=1000,
-              decay_every=np.inf, 
+              decay_every=np.inf,
+              cnn_ckpt='/home/paperspace/data/pretrained/mobilenet_1_0_224_tf_no_top.h5',
               ckpt=None):
         '''''' 
         backend.set_learning_phase(True)
@@ -57,27 +75,28 @@ class TextGen(BaseModel):
             x_train, y_train, _ = self.read_tfrecord(train_record, 
                 batch_size=batch_size, capacity=capacity, n_threads=n_read_threads)
             x_train = self.preproc_img(x_train)
-            y_train = self.preproc_caption(y_train)
+            y_train_onehots, y_train_inds = self.preproc_caption(y_train)
         
         with tf.variable_scope('StagingArea'):
             print('creating staging area')
 
             get, SA_size, put_op = self.stage_data(
-                [x_train, y_train], capacity=capacity)
-            x_train, y_train = get
+                [x_train, y_train_inds], capacity=capacity)
+            x_train, y_train_inds = get
             step = tf.Variable(0, name='step')
             update_step = tf.assign_add(step, 1)
 
         with tf.variable_scope('Optimizer'):
             print('creating optimizer')
 
-            y_hat = self.forward_pass(x_train)
-            L = tf.reduce_mean(losses.categorical_crossentropy(
-                    y_train, y_hat))
+            L = self.xent_loss(x_train, y_train_onehots)
+            Lg = self.grad_loss(L, self.lstm.trainable_weights)
+            L2 = self.l2_loss(x_train)
+            Ltot = L + lambda_Lg*Lg + lambda_L2*L2
             lr = lr_init * 0.5**tf.floor(
                 tf.cast(step, tf.float32) / decay_every)
             opt = tf.train.AdamOptimizer(lr, beta1=0.8, beta2=0.999)\
-                .minimize(L, var_list=self.trainable_weights)
+                .minimize(Ltot, var_list=self.trainable_weights)
 
         with tf.variable_scope('Summary'):
             print('creating summary')
@@ -85,13 +104,21 @@ class TextGen(BaseModel):
             x_val, y_val, _ = self.read_tfrecord(val_record, 
                 batch_size=batch_size, n_threads=1)
             x_val = self.preproc_img(x_val)
-            y_val = self.preproc_caption(y_val)
-            y_hat_val = self.forward_pass(x_val)
-            L_val = tf.reduce_mean(losses.categorical_crossentropy(
-                        y_val, y_hat_val))
-            scalar_dict = {'train_loss': L, 'val_loss': L_val, 'SA_size': SA_size}
+            y_val_onehots, y_val_inds = self.preproc_caption(y_val)
+            sx = tf.Variable(x_val)
+            L_val = self.xent_loss(x_val, y_val_onehots)
+            Lg_val = self.grad_loss(L_val, self.lstm.trainable_weights)
+            L2_val = self.l2_loss(x_val)
+            Ltot_val = L_val + lambda_Lg*Lg_val + lambda_L2*L2_val
+            scalar_dict = {'xent_loss': L_val, 
+                           'grad_loss': Lg_val,
+                           'l2_loss': L2_val,
+                           'tot_loss': Ltot_val,
+                           'SA_size': SA_size, 
+                           'lr': lr}
         summary_op, summary_writer = self.make_summary(
-            output_path, img_dict={}, scalar_dict=scalar_dict, text_dict={})
+            output_path, img_dict={}, 
+            scalar_dict=scalar_dict, text_dict={})
 
         with tf.Session(graph=self.graph) as sess:
             print('starting threads')
@@ -104,6 +131,9 @@ class TextGen(BaseModel):
             if ckpt: 
                 print('loading weights from '+ckpt)
                 self.load_weights(ckpt)
+            elif cnn_ckpt:
+                print('loading cnn weights from '+cnn_ckpt)
+                self.phi.load_weights(cnn_ckpt)
             print('finalizing graph')
             self.graph.finalize()
             try:
@@ -113,13 +143,16 @@ class TextGen(BaseModel):
                     for _ in tqdm.trange(epoch_size, disable=False):
                         if not (coord.should_stop() or stage_stop.is_set()):
 
+                            # update weights                        
                             _, n = sess.run([opt, update_step])
 
+                            # validate
                             if n % validate_every == 1:
                                 s = sess.run(summary_op)
                                 summary_writer.add_summary(s, n)
                                 summary_writer.flush()
 
+                            # write checkpoint
                             if n % save_every == 0:
                                 self.save_h5(output_path, n)
                     epoch += 1
