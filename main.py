@@ -1,5 +1,6 @@
 from __future__ import print_function, division
 import os
+import time
 import tqdm
 import numpy as np
 import tensorflow as tf
@@ -8,7 +9,8 @@ from utils.models import *
 __author__ = 'Jonathan Kyl'
 
 class TextGen(BaseModel):
-    def __init__(self, img_size=224, code_dim=128, length=20, words=9509):
+    def __init__(self, img_size=224, code_dim=128, length=20, words=9509, 
+                 rnn='LSTM', activations=['linear', 'linear']):
         ''''''
         self.img_size = img_size
         self.length = length
@@ -16,37 +18,39 @@ class TextGen(BaseModel):
         self.code_dim = code_dim
         
         with tf.variable_scope('CNN'):
-            self.phi = cnn(kind='mobilenet', include_top=False, weights=None)
+            self.phi = cnn(kind='inception', include_top=False, weights=None)
             self.phi_dim = self.phi.output_shape[-1]
 
-        with tf.variable_scope('LSTM'):
-            self.lstm = lstm_decoder(input_dim=self.phi_dim, 
-                                     length=length, 
-                                     code_dim=code_dim,
-                                     output_dim=words, 
-                                     activation='softmax')
+        with tf.variable_scope('RNN'):
+            self.rnn = rnn_decoder(input_dim=self.phi_dim, 
+                                   length=length, 
+                                   code_dim=code_dim,
+                                   output_dim=words, 
+                                   rnn=rnn,
+                                   activations=activations)
 
         super(BaseModel, self).__init__(
-            self.phi.inputs + self.lstm.inputs,
-            self.phi.outputs + self.lstm.outputs)
+            self.phi.inputs + self.rnn.inputs,
+            self.phi.outputs + self.rnn.outputs)
 
     def forward_pass(self, x):
         ''''''
-        return self.lstm(self.phi(x))
+        return self.rnn(self.phi(x))
     
     def xent_loss(self, x, y):
         ''''''
-        return tf.reduce_mean(losses.categorical_crossentropy(
-                    y, self.forward_pass(x)))
+        return tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(
+                    labels=y, logits=self.forward_pass(x)))
     
     def grad_loss(self, L, w):
-        grads = tf.gradients(L, w)
-        n_params = tf.reduce_sum([tf.cast(tf.reduce_prod(v.shape), tf.float32) for v in w])
-        sum_of_squared = tf.reduce_sum([tf.reduce_sum(g**2) for g in grads])
-        return sum_of_squared / n_params
-    
+        ''''''
+        gradients = tf.gradients(L, w)
+        g_vector = tf.concat([tf.reshape(g, [-1]) for g in gradients], 0)
+        return tf.reduce_sum(g_vector**2)
+
     def l2_loss(self, x):
-        return tf.reduce_mean(self.phi(x)**2)
+        ''''''
+        return tf.reduce_sum(self.phi(x)**2)
 
     def train(self, 
               train_record, 
@@ -56,6 +60,7 @@ class TextGen(BaseModel):
               lr_init=1e-4, 
               lambda_Lg=0,
               lambda_L2=0,
+              all_trainable=True,
               n_read_threads=4,
               n_stage_threads=2,
               capacity=16,
@@ -63,7 +68,9 @@ class TextGen(BaseModel):
               validate_every=100,
               save_every=1000,
               decay_every=np.inf,
-              cnn_ckpt='/home/paperspace/data/pretrained/mobilenet_1_0_224_tf_no_top.h5',
+              optimizer='Adam',
+              clip_gradients=None, 
+              cnn_ckpt='/home/paperspace/data/pretrained/inception_v3_weights_tf_dim_ordering_tf_kernels_notop.h5',
               ckpt=None):
         '''''' 
         backend.set_learning_phase(True)
@@ -89,14 +96,24 @@ class TextGen(BaseModel):
         with tf.variable_scope('Optimizer'):
             print('creating optimizer')
 
-            L = self.xent_loss(x_train, y_train_onehots)
-            Lg = self.grad_loss(L, self.lstm.trainable_weights)
+            if all_trainable:
+                train_vars = self.trainable_variables
+            else:
+                train_vars = self.rnn.trainable_variables
+            
+            L = self.xent_loss(x_train, y_train_inds)
+            Lg = self.grad_loss(L, self.rnn.trainable_weights)
             L2 = self.l2_loss(x_train)
-            Ltot = L + lambda_Lg*Lg + lambda_L2*L2
+            Ltot = L + lambda_L2*L2 #+ lambda_Lg*Lg
+                        
             lr = lr_init * 0.5**tf.floor(
                 tf.cast(step, tf.float32) / decay_every)
-            opt = tf.train.AdamOptimizer(lr, beta1=0.8, beta2=0.999)\
-                .minimize(Ltot, var_list=self.trainable_weights)
+            
+            opt = tf.train.AdamOptimizer(lr)
+            grads_and_vars = opt.compute_gradients(Ltot, var_list=train_vars)
+            if clip_gradients:
+                grads_and_vars = clip_gradients_by_norm(grads_and_vars, clip_gradients)
+            opt = opt.apply_gradients(grads_and_vars)
 
         with tf.variable_scope('Summary'):
             print('creating summary')
@@ -105,11 +122,10 @@ class TextGen(BaseModel):
                 batch_size=batch_size, n_threads=1)
             x_val = self.preproc_img(x_val)
             y_val_onehots, y_val_inds = self.preproc_caption(y_val)
-            sx = tf.Variable(x_val)
-            L_val = self.xent_loss(x_val, y_val_onehots)
-            Lg_val = self.grad_loss(L_val, self.lstm.trainable_weights)
+            L_val = self.xent_loss(x_val, y_val_inds)
+            Lg_val = self.grad_loss(L_val, self.rnn.trainable_weights)
             L2_val = self.l2_loss(x_val)
-            Ltot_val = L_val + lambda_Lg*Lg_val + lambda_L2*L2_val
+            Ltot_val = L_val + lambda_L2*L2_val #+ lambda_Lg*Lg_val
             scalar_dict = {'xent_loss': L_val, 
                            'grad_loss': Lg_val,
                            'l2_loss': L2_val,
@@ -117,8 +133,7 @@ class TextGen(BaseModel):
                            'SA_size': SA_size, 
                            'lr': lr}
         summary_op, summary_writer = self.make_summary(
-            output_path, img_dict={}, 
-            scalar_dict=scalar_dict, text_dict={})
+            output_path, scalar_dict=scalar_dict)
 
         with tf.Session(graph=self.graph) as sess:
             print('starting threads')
@@ -139,7 +154,7 @@ class TextGen(BaseModel):
             try:
                 epoch = 1
                 while True:
-                    print('epoch: ' + str(epoch))
+                    print('epoch: ' + str(epoch)); time.sleep(0.2)
                     for _ in tqdm.trange(epoch_size, disable=False):
                         if not (coord.should_stop() or stage_stop.is_set()):
 
