@@ -107,17 +107,20 @@ class BaseModel(models.Model):
         img += 127.5
         return tf.cast(img, tf.uint8)
     
-    def preproc_caption(self, caption):
+    def preproc_caption(self, caption, random=True):
         ''''''
-        def per_batch_inds(cap, minus_ones=False):
-            start = cap[:, 1]
-            good = tf.where(tf.greater(start, -1))
-            rand = good[tf.random_uniform(minval=0, maxval=tf.shape(good)[0], 
-                                          shape=[], dtype=tf.int32)]
-            cap = cap[tf.squeeze(rand)]
-            if not minus_ones:
-                return tf.where(tf.less(cap, 0), (self.words-1)*tf.ones_like(cap), cap)
-            return cap
+        def per_batch_inds(cap, minus_ones=False, random=random):
+            if random:
+                start = cap[:, 1]
+                good = tf.where(tf.greater(start, -1))
+                rand = good[tf.random_uniform(minval=0, maxval=tf.shape(good)[0], 
+                                              shape=[], dtype=tf.int32)]
+                cap = cap[tf.squeeze(rand)]
+            else:
+                cap = cap[0]
+            if minus_ones:
+                return cap
+            return tf.where(tf.less(cap, 0), (self.words-1)*tf.ones_like(cap), cap)
         def per_batch_onehots(cap):
             cap = per_batch_inds(cap, minus_ones=True)
             nonpad = tf.squeeze(tf.where(tf.greater(cap, -1)))

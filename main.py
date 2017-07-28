@@ -61,6 +61,7 @@ class TextGen(BaseModel):
               lambda_Lg=0,
               lambda_L2=0,
               all_trainable=True,
+              random_captions=True,
               n_read_threads=4,
               n_stage_threads=2,
               capacity=16,
@@ -70,7 +71,7 @@ class TextGen(BaseModel):
               decay_every=np.inf,
               optimizer='Adam',
               clip_gradients=None, 
-              cnn_ckpt='/home/paperspace/data/pretrained/inception_v3_weights_tf_dim_ordering_tf_kernels_notop.h5',
+              cnn_ckpt='utils/inception_v3_weights_tf_dim_ordering_tf_kernels_notop.h5',
               ckpt=None):
         '''''' 
         backend.set_learning_phase(True)
@@ -82,7 +83,7 @@ class TextGen(BaseModel):
             x_train, y_train, _ = self.read_tfrecord(train_record, 
                 batch_size=batch_size, capacity=capacity, n_threads=n_read_threads)
             x_train = self.preproc_img(x_train)
-            y_train_onehots, y_train_inds = self.preproc_caption(y_train)
+            y_train_onehots, y_train_inds = self.preproc_caption(y_train, random=random_captions)
         
         with tf.variable_scope('StagingArea'):
             print('creating staging area')
@@ -100,15 +101,12 @@ class TextGen(BaseModel):
                 train_vars = self.trainable_variables
             else:
                 train_vars = self.rnn.trainable_variables
-            
             L = self.xent_loss(x_train, y_train_inds)
             Lg = self.grad_loss(L, self.rnn.trainable_weights)
             L2 = self.l2_loss(x_train)
             Ltot = L + lambda_L2*L2 #+ lambda_Lg*Lg
-                        
             lr = lr_init * 0.5**tf.floor(
                 tf.cast(step, tf.float32) / decay_every)
-            
             opt = tf.train.AdamOptimizer(lr)
             grads_and_vars = opt.compute_gradients(Ltot, var_list=train_vars)
             if clip_gradients:
@@ -121,7 +119,7 @@ class TextGen(BaseModel):
             x_val, y_val, _ = self.read_tfrecord(val_record, 
                 batch_size=batch_size, n_threads=1)
             x_val = self.preproc_img(x_val)
-            y_val_onehots, y_val_inds = self.preproc_caption(y_val)
+            y_val_onehots, y_val_inds = self.preproc_caption(y_val, random=random_captions)
             L_val = self.xent_loss(x_val, y_val_inds)
             Lg_val = self.grad_loss(L_val, self.rnn.trainable_weights)
             L2_val = self.l2_loss(x_val)
@@ -136,19 +134,26 @@ class TextGen(BaseModel):
             output_path, scalar_dict=scalar_dict)
 
         with tf.Session(graph=self.graph) as sess:
+            
             print('starting threads')
             stage_stop, stage_threads = self.start_threads(
                 sess, coord, put_op, n_stage_threads=n_stage_threads)
+            
             print('initializing variables')
             sess.run(tf.global_variables_initializer())
-            print('saving weights')
-            self.save_h5(output_path, 0)
+            
+            if save_every != np.inf:
+                print('saving weights')
+                self.save_h5(output_path, 0)
+                
             if ckpt: 
                 print('loading weights from '+ckpt)
                 self.load_weights(ckpt)
+                
             elif cnn_ckpt:
                 print('loading cnn weights from '+cnn_ckpt)
                 self.phi.load_weights(cnn_ckpt)
+                
             print('finalizing graph')
             self.graph.finalize()
             try:
@@ -180,15 +185,12 @@ if __name__ == '__main__':
     import argparse
     p = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument('input_path', type=str, 
-        help='directory containing jpg or png files on which to train')
+    p.add_argument('train_record', type=str, 
+        help='tfrecord file containing preprocessed and serialized training data')
+    p.add_argument('val_record', type=str, 
+        help='tfrecord file containing preprocessed and serialized validation data')
     p.add_argument('output_path', type=str, 
-        help='output directory to put checkpoints and samples')
-    p.add_argument('-g', '--gpu', type=int, default=0,
-        help='identity of the GPU to use')
+        help='path in which to save weights and tensorboard summaries')
     d = p.parse_args().__dict__
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(d.pop('gpu'))
-    s = TextGen(
-        gan_depth=d.pop('gan_depth'),
-        ae_depth=d.pop('ae_depth'))
-    s.train(**d)
+    tg = TextGen()
+    tg.train(**d)

@@ -74,7 +74,6 @@ def main(imgs_path, captions_json, classes_json, output_tfrecord,
         try:
             for _ in tqdm.trange(n):
                 img, caption, class_ = sess.run([img_op, caption_op, class_op])
-                #return img, caption
                 example = tf.train.Example(features=tf.train.Features(feature={
                     'image_size': _int64_feature(img_size),
                     'vocab_size': _int64_feature(vocab_size),
