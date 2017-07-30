@@ -18,7 +18,7 @@ class BaseModel(models.Model):
         with tf.device('/cpu:0'):
             reader = tf.TFRecordReader()
             _, serialized_example = reader.read(
-                tf.train.string_input_producer([tfrecord]))
+                tf.train.string_input_producer([tfrecord], shuffle=True))
             feature = {'image': tf.FixedLenFeature([], tf.string),
                        'caption': tf.FixedLenFeature([], tf.string),
                        'class': tf.FixedLenFeature([], tf.int64),
@@ -122,7 +122,7 @@ class BaseModel(models.Model):
                 return cap
             return tf.where(tf.less(cap, 0), (self.words-1)*tf.ones_like(cap), cap)
         def per_batch_onehots(cap):
-            cap = per_batch_inds(cap, minus_ones=True)
+            cap = per_batch_inds(cap, minus_ones=False)
             nonpad = tf.squeeze(tf.where(tf.greater(cap, -1)))
             cap_nonpad = tf.gather(cap, nonpad)
             eye = tf.eye(self.words, dtype=tf.float32)
@@ -173,12 +173,44 @@ def rnn_decoder(input_dim, length, code_dim, output_dim,
     out = layers.Conv1D(output_dim, 1, activation=activations[1])(rnn)
     return models.Model(inp, out)
 
-def cnn(kind='xception', classes=None, weights=None, include_top=False, pooling='max'):
+def seq2seq(input_dim, length, code_dim, output_dim, rnn='LSTM'):
+    
+    inp = layers.Input(shape=(input_dim,), name='lstm_input')
+    def repeat_timedim(x):
+        x = tf.expand_dims(x, 1)
+        return tf.tile(x, [1, length, 1])
+    rep = layers.Lambda(repeat_timedim)(inp)
+    enc = eval('layers.'+rnn)(code_dim, return_sequences=True, 
+                unroll=True, activation='linear')(rep)
+    dec = eval('layers.'+rnn)(input_dim, return_sequences=False, 
+                unroll=True, activation='linear')(enc)
+    out = layers.Conv1D(output_dim, 1, activation='linear')(enc)
+    return models.Model(inp, [out, dec])
+
+def spatial_attention_rnn(input_shape, length, code_dim, output_dim, rnn='LSTM'):
+    ''''''
+    inp = layers.Input(shape=input_shape)
+    flat = layers.Flatten()(inp)
+    context = layers.Dense(code_dim, activation='elu')(flat)
+    context = layers.Lambda(lambda x: 
+                  tf.tile(tf.expand_dims(x, 1), [1, length, 1]))(context)
+    rnn1 = eval('layers.'+rnn)(code_dim, return_sequences=True, 
+                               unroll=True, activation='linear')(context)
+    merge = layers.concatenate([rnn1, context], axis=-1)
+    rnn2 = eval('layers.'+rnn)(code_dim, return_sequences=True, 
+                               unroll=True, activation='linear')(merge)
+    out = layers.Conv1D(output_dim, 1, activation='elu')(rnn2)
+    return models.Model(inp, out)
+    
+
+def cnn(input_shape, kind='xception', classes=None, weights=None, include_top=False, pooling='max'):
     ''''''
     if kind == 'inception':
-        return InceptionV3(classes=classes, pooling=pooling,
-            include_top=include_top, weights=weights)
+        return InceptionV3(input_shape=input_shape, 
+                           classes=classes, pooling=pooling,
+                           include_top=include_top, weights=weights)
     elif kind == 'mobilenet':
-        return MobileNet(classes=classes, pooling=pooling,
-            include_top=include_top, weights=weights)
+        return MobileNet(input_shape=input_shape, 
+                         classes=classes, pooling=pooling,
+                         include_top=include_top, weights=weights)
 

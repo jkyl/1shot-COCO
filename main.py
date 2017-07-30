@@ -9,8 +9,7 @@ from utils.models import *
 __author__ = 'Jonathan Kyl'
 
 class TextGen(BaseModel):
-    def __init__(self, img_size=224, code_dim=128, length=20, words=9509, 
-                 rnn='LSTM', activations=['linear', 'linear']):
+    def __init__(self, img_size=224, code_dim=128, length=20, words=9509, rnn='LSTM'):
         ''''''
         self.img_size = img_size
         self.length = length
@@ -18,16 +17,21 @@ class TextGen(BaseModel):
         self.code_dim = code_dim
         
         with tf.variable_scope('CNN'):
-            self.phi = cnn(kind='inception', include_top=False, weights=None)
-            self.phi_dim = self.phi.output_shape[-1]
+            self.phi = cnn(
+                input_shape=(img_size, img_size, 3),
+                kind='inception', 
+                include_top=False, 
+                weights=None, 
+                pooling=None)
+            self.phi_dim = self.phi.output_shape[1:]
 
         with tf.variable_scope('RNN'):
-            self.rnn = rnn_decoder(input_dim=self.phi_dim, 
-                                   length=length, 
-                                   code_dim=code_dim,
-                                   output_dim=words, 
-                                   rnn=rnn,
-                                   activations=activations)
+            self.rnn = spatial_attention_rnn(
+                input_shape=self.phi_dim, 
+                length=length, 
+                code_dim=code_dim,
+                output_dim=words, 
+                rnn=rnn)
 
         super(BaseModel, self).__init__(
             self.phi.inputs + self.rnn.inputs,
@@ -37,29 +41,25 @@ class TextGen(BaseModel):
         ''''''
         return self.rnn(self.phi(x))
     
-    def xent_loss(self, x, y):
+    def xent_loss(self, x, y, sparse=True):
         ''''''
-        return tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(
-                    labels=y, logits=self.forward_pass(x)))
+        if sparse:
+            return tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(
+                        labels=y, logits=self.forward_pass(x)))
+        return tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(
+                        labels=y, logits=self.forward_pass(x)))
     
-    def grad_loss(self, L, w):
-        ''''''
-        gradients = tf.gradients(L, w)
-        g_vector = tf.concat([tf.reshape(g, [-1]) for g in gradients], 0)
-        return tf.reduce_sum(g_vector**2)
-
-    def l2_loss(self, x):
-        ''''''
-        return tf.reduce_sum(self.phi(x)**2)
-
+    def gradient_norm(self, L, w):
+        grads = tf.concat([tf.reshape(g, [-1]) for g in tf.gradients(L, w)], 0)
+        return tf.reduce_sum((1 - grads)**2)
+    
     def train(self, 
               train_record, 
               val_record,
               output_path,
+              lambda_Lg=0, 
               batch_size=16, 
               lr_init=1e-4, 
-              lambda_Lg=0,
-              lambda_L2=0,
               all_trainable=True,
               random_captions=True,
               n_read_threads=4,
@@ -101,10 +101,9 @@ class TextGen(BaseModel):
                 train_vars = self.trainable_variables
             else:
                 train_vars = self.rnn.trainable_variables
-            L = self.xent_loss(x_train, y_train_inds)
-            Lg = self.grad_loss(L, self.rnn.trainable_weights)
-            L2 = self.l2_loss(x_train)
-            Ltot = L + lambda_L2*L2 #+ lambda_Lg*Lg
+            L = self.xent_loss(x_train, y_train_inds, sparse=True)
+            #Lg = self.gradient_norm(L, self.rnn.trainable_variables)
+            Ltot = L #+ lambda_Lg*Lg
             lr = lr_init * 0.5**tf.floor(
                 tf.cast(step, tf.float32) / decay_every)
             opt = tf.train.AdamOptimizer(lr)
@@ -120,15 +119,13 @@ class TextGen(BaseModel):
                 batch_size=batch_size, n_threads=1)
             x_val = self.preproc_img(x_val)
             y_val_onehots, y_val_inds = self.preproc_caption(y_val, random=random_captions)
-            L_val = self.xent_loss(x_val, y_val_inds)
-            Lg_val = self.grad_loss(L_val, self.rnn.trainable_weights)
-            L2_val = self.l2_loss(x_val)
-            Ltot_val = L_val + lambda_L2*L2_val #+ lambda_Lg*Lg_val
+            L_val = self.xent_loss(x_val, y_val_inds, sparse=True)
+            Lg_val = self.gradient_norm(L_val, self.rnn.trainable_variables)
+            Ltot_val = L_val #+ lambda_Lg*Lg_val
             scalar_dict = {'xent_loss': L_val, 
-                           'grad_loss': Lg_val,
-                           'l2_loss': L2_val,
                            'tot_loss': Ltot_val,
                            'SA_size': SA_size, 
+                           'gradient_norm': Lg_val,
                            'lr': lr}
         summary_op, summary_writer = self.make_summary(
             output_path, scalar_dict=scalar_dict)
