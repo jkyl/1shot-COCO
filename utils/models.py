@@ -1,11 +1,13 @@
 from __future__ import division, print_function
 import os
 import json
+import time
 import threading
 import numpy as np
 import tensorflow as tf
 from mobilenet import *
 from inception_v3 import *
+from custom_recurrents import *
 from tensorflow.contrib.keras import layers, models, backend, applications, losses
 from tensorflow.contrib.staging import StagingArea
 
@@ -173,36 +175,36 @@ def rnn_decoder(input_dim, length, code_dim, output_dim,
     out = layers.Conv1D(output_dim, 1, activation=activations[1])(rnn)
     return models.Model(inp, out)
 
-def seq2seq(input_dim, length, code_dim, output_dim, rnn='LSTM'):
-    
-    inp = layers.Input(shape=(input_dim,), name='lstm_input')
-    def repeat_timedim(x):
-        x = tf.expand_dims(x, 1)
-        return tf.tile(x, [1, length, 1])
-    rep = layers.Lambda(repeat_timedim)(inp)
-    enc = eval('layers.'+rnn)(code_dim, return_sequences=True, 
-                unroll=True, activation='linear')(rep)
-    dec = eval('layers.'+rnn)(input_dim, return_sequences=False, 
-                unroll=True, activation='linear')(enc)
-    out = layers.Conv1D(output_dim, 1, activation='linear')(enc)
-    return models.Model(inp, [out, dec])
-
 def spatial_attention_rnn(input_shape, length, code_dim, output_dim, rnn='LSTM'):
     ''''''
-    inp = layers.Input(shape=input_shape)
-    flat = layers.Flatten()(inp)
-    context = layers.Dense(code_dim, activation='elu')(flat)
-    context = layers.Lambda(lambda x: 
-                  tf.tile(tf.expand_dims(x, 1), [1, length, 1]))(context)
-    rnn1 = eval('layers.'+rnn)(code_dim, return_sequences=True, 
-                               unroll=True, activation='linear')(context)
-    merge = layers.concatenate([rnn1, context], axis=-1)
-    rnn2 = eval('layers.'+rnn)(code_dim, return_sequences=True, 
-                               unroll=True, activation='linear')(merge)
-    out = layers.Conv1D(output_dim, 1, activation='elu')(rnn2)
+    inp = code = layers.Input(shape=input_shape)
+    if len(input_shape) > 2:
+        code = layers.Flatten()(code)
+    
+    code = layers.RepeatVector(length)(code)
+    code = layers.Dropout(0.3)(code)
+    input_dim = input_shape[-1]
+    
+    if rnn in ('LSTM', 'GRU'):
+        attn = Attn3D(code, length, code_dim)
+        rnn = layers.Bidirectional(eval('layers.'+rnn)(code_dim, return_sequences=True, 
+                    unroll=True, activation='linear'), merge_mode='concat')(attn)
+    elif rnn == 'seq2seq':
+        from recurrentshop import RecurrentSequential
+        from seq2seq.cells import LSTMDecoderCell, AttentionDecoderCell
+        decoder = RecurrentSequential(decode=True, output_length=length,
+                                      unroll=True, stateful=False)
+        decoder.add(AttentionDecoderCell(output_dim=code_dim, hidden_dim=code_dim, activation='tanh'))
+        decoder.add(LSTMDecoderCell(output_dim=code_dim, hidden_dim=code_dim, activation='linear'))
+        rnn = decoder(code)
+
+    else:
+        rnn = AttentionDecoder(code_dim, code_dim, return_sequences=True, 
+                               unroll=True, activation='linear')(code)
+        
+    out = layers.Conv1D(output_dim, 1)(rnn)
     return models.Model(inp, out)
     
-
 def cnn(input_shape, kind='xception', classes=None, weights=None, include_top=False, pooling='max'):
     ''''''
     if kind == 'inception':
@@ -213,4 +215,13 @@ def cnn(input_shape, kind='xception', classes=None, weights=None, include_top=Fa
         return MobileNet(input_shape=input_shape, 
                          classes=classes, pooling=pooling,
                          include_top=include_top, weights=weights)
-
+    
+def Attn3D(inp, length, dim):
+    '''
+    https://github.com/philipperemy/keras-attention-mechanism/blob/master/attention_lstm.py
+    '''
+    x = layers.Permute((2, 1))(inp)
+    x = layers.Reshape((dim, length))(x)
+    x = layers.Dense(length, activation='softmax')(x)
+    x = layers.Permute((2, 1))(x)
+    return layers.multiply([inp, x])

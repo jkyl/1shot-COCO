@@ -22,7 +22,7 @@ class TextGen(BaseModel):
                 kind='inception', 
                 include_top=False, 
                 weights=None, 
-                pooling=None)
+                pooling='avg')
             self.phi_dim = self.phi.output_shape[1:]
 
         with tf.variable_scope('RNN'):
@@ -50,8 +50,11 @@ class TextGen(BaseModel):
                         labels=y, logits=self.forward_pass(x)))
     
     def gradient_norm(self, L, w):
-        grads = tf.concat([tf.reshape(g, [-1]) for g in tf.gradients(L, w)], 0)
-        return tf.reduce_sum((1 - grads)**2)
+        return tf.reduce_sum(tf.concat([tf.reshape(
+            g, [-1]) for g in tf.gradients(L, w)], 0)**2)**.5
+    
+    def l2_loss(self, x):
+        return tf.reduce_mean((1 - x)**2)
     
     def train(self, 
               train_record, 
@@ -106,7 +109,7 @@ class TextGen(BaseModel):
             Ltot = L #+ lambda_Lg*Lg
             lr = lr_init * 0.5**tf.floor(
                 tf.cast(step, tf.float32) / decay_every)
-            opt = tf.train.AdamOptimizer(lr)
+            opt = tf.train.AdamOptimizer(lr, beta1=0.9, beta2=0.999)
             grads_and_vars = opt.compute_gradients(Ltot, var_list=train_vars)
             if clip_gradients:
                 grads_and_vars = clip_gradients_by_norm(grads_and_vars, clip_gradients)
@@ -120,12 +123,11 @@ class TextGen(BaseModel):
             x_val = self.preproc_img(x_val)
             y_val_onehots, y_val_inds = self.preproc_caption(y_val, random=random_captions)
             L_val = self.xent_loss(x_val, y_val_inds, sparse=True)
-            Lg_val = self.gradient_norm(L_val, self.rnn.trainable_variables)
+            G_val = self.gradient_norm(L_val, self.rnn.trainable_variables)
             Ltot_val = L_val #+ lambda_Lg*Lg_val
-            scalar_dict = {'xent_loss': L_val, 
-                           'tot_loss': Ltot_val,
+            scalar_dict = {'L_val': L_val, 
+                           'L_train': L,
                            'SA_size': SA_size, 
-                           'gradient_norm': Lg_val,
                            'lr': lr}
         summary_op, summary_writer = self.make_summary(
             output_path, scalar_dict=scalar_dict)
