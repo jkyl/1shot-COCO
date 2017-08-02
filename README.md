@@ -1,1 +1,1 @@
-# textgen
+# textgen -- low-shot image captioning network

@@ -22,7 +22,7 @@ class TextGen(BaseModel):
                 kind='inception', 
                 include_top=False, 
                 weights=None, 
-                pooling='avg')
+                pooling=None)
             self.phi_dim = self.phi.output_shape[1:]
 
         with tf.variable_scope('RNN'):
@@ -60,7 +60,7 @@ class TextGen(BaseModel):
               train_record, 
               val_record,
               output_path,
-              lambda_Lg=0, 
+              lambda_reg=0, 
               batch_size=16, 
               lr_init=1e-4, 
               all_trainable=True,
@@ -72,12 +72,11 @@ class TextGen(BaseModel):
               validate_every=100,
               save_every=1000,
               decay_every=np.inf,
-              optimizer='Adam',
+              optimizer='adam',
               clip_gradients=None, 
-              cnn_ckpt='utils/inception_v3_weights_tf_dim_ordering_tf_kernels_notop.h5',
+              cnn_ckpt='pretrained/inception_v3_weights.h5',
               ckpt=None):
         '''''' 
-        backend.set_learning_phase(True)
         
         with tf.variable_scope('BatchReader'):
             print('creating batch reader')
@@ -96,6 +95,7 @@ class TextGen(BaseModel):
             x_train, y_train_inds = get
             step = tf.Variable(0, name='step')
             update_step = tf.assign_add(step, 1)
+            learning = backend.learning_phase()
 
         with tf.variable_scope('Optimizer'):
             print('creating optimizer')
@@ -105,11 +105,17 @@ class TextGen(BaseModel):
             else:
                 train_vars = self.rnn.trainable_variables
             L = self.xent_loss(x_train, y_train_inds, sparse=True)
-            #Lg = self.gradient_norm(L, self.rnn.trainable_variables)
-            Ltot = L #+ lambda_Lg*Lg
+            reg = tf.reduce_sum([tf.nn.l2_loss(v) for v in self.rnn.trainable_variables])
+            Ltot = L + lambda_reg*reg
             lr = lr_init * 0.5**tf.floor(
                 tf.cast(step, tf.float32) / decay_every)
-            opt = tf.train.AdamOptimizer(lr, beta1=0.9, beta2=0.999)
+            
+            if optimizer=='adam':
+                opt = tf.train.AdamOptimizer(lr, beta1=0.9, beta2=0.999)
+            elif optimizer=='adadelta':
+                opt = tf.train.AdadeltaOptimizer(lr)
+            else:
+                raise ValueError, 'must specify optimizer'
             grads_and_vars = opt.compute_gradients(Ltot, var_list=train_vars)
             if clip_gradients:
                 grads_and_vars = clip_gradients_by_norm(grads_and_vars, clip_gradients)
@@ -123,10 +129,9 @@ class TextGen(BaseModel):
             x_val = self.preproc_img(x_val)
             y_val_onehots, y_val_inds = self.preproc_caption(y_val, random=random_captions)
             L_val = self.xent_loss(x_val, y_val_inds, sparse=True)
-            G_val = self.gradient_norm(L_val, self.rnn.trainable_variables)
-            Ltot_val = L_val #+ lambda_Lg*Lg_val
             scalar_dict = {'L_val': L_val, 
                            'L_train': L,
+                           'reg': reg,
                            'SA_size': SA_size, 
                            'lr': lr}
         summary_op, summary_writer = self.make_summary(
@@ -163,11 +168,13 @@ class TextGen(BaseModel):
                         if not (coord.should_stop() or stage_stop.is_set()):
 
                             # update weights                        
-                            _, n = sess.run([opt, update_step])
+                            _, n = sess.run([opt, update_step],
+                                            {learning: True})
 
                             # validate
                             if n % validate_every == 1:
-                                s = sess.run(summary_op)
+                                s = sess.run(summary_op,
+                                            {learning: False})
                                 summary_writer.add_summary(s, n)
                                 summary_writer.flush()
 

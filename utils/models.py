@@ -5,9 +5,7 @@ import time
 import threading
 import numpy as np
 import tensorflow as tf
-from mobilenet import *
 from inception_v3 import *
-from custom_recurrents import *
 from tensorflow.contrib.keras import layers, models, backend, applications, losses
 from tensorflow.contrib.staging import StagingArea
 
@@ -21,12 +19,13 @@ class BaseModel(models.Model):
             reader = tf.TFRecordReader()
             _, serialized_example = reader.read(
                 tf.train.string_input_producer([tfrecord], shuffle=True))
-            feature = {'image': tf.FixedLenFeature([], tf.string),
-                       'caption': tf.FixedLenFeature([], tf.string),
-                       'class': tf.FixedLenFeature([], tf.int64),
-                       'image_size': tf.FixedLenFeature([], tf.int64),
-                       'vocab_size': tf.FixedLenFeature([], tf.int64),
-                       'length': tf.FixedLenFeature([], tf.int64)} 
+            feature = {
+                'image': tf.FixedLenFeature([], tf.string),
+                'caption': tf.FixedLenFeature([], tf.string),
+                'class': tf.FixedLenFeature([], tf.int64),
+                'image_size': tf.FixedLenFeature([], tf.int64),
+                'vocab_size': tf.FixedLenFeature([], tf.int64),
+                'length': tf.FixedLenFeature([], tf.int64)} 
             f = tf.parse_single_example(serialized_example, features=feature)
             img, caption, class_ = f['image'], f['caption'], f['class']
             img = tf.image.decode_jpeg(img)
@@ -130,7 +129,7 @@ class BaseModel(models.Model):
             eye = tf.eye(self.words, dtype=tf.float32)
             onehot = tf.gather(eye, cap_nonpad)
             padded = tf.pad(onehot, [[0, self.length-tf.shape(onehot)[0]], [0, 0]], 
-                            mode='CONSTANT', constant_values=0)
+                            mode='CONSTANT')#, constant_values=0)
             return padded
         inds_mapped = tf.map_fn(per_batch_inds, caption, dtype=tf.int64)
         onehots_mapped = tf.map_fn(per_batch_onehots, caption, dtype=tf.float32)
@@ -178,29 +177,31 @@ def rnn_decoder(input_dim, length, code_dim, output_dim,
 def spatial_attention_rnn(input_shape, length, code_dim, output_dim, rnn='LSTM'):
     ''''''
     inp = code = layers.Input(shape=input_shape)
-    if len(input_shape) > 2:
+    if len(input_shape) > 1:
         code = layers.Flatten()(code)
-    
-    code = layers.RepeatVector(length)(code)
+        
     code = layers.Dropout(0.3)(code)
+    code = layers.RepeatVector(length)(code)
     input_dim = input_shape[-1]
     
     if rnn in ('LSTM', 'GRU'):
         attn = Attn3D(code, length, code_dim)
         rnn = layers.Bidirectional(eval('layers.'+rnn)(code_dim, return_sequences=True, 
                     unroll=True, activation='linear'), merge_mode='concat')(attn)
+        
     elif rnn == 'seq2seq':
-        from recurrentshop import RecurrentSequential
+        from recurrentshop import RecurrentSequential, RecurrentModel
         from seq2seq.cells import LSTMDecoderCell, AttentionDecoderCell
         decoder = RecurrentSequential(decode=True, output_length=length,
                                       unroll=True, stateful=False)
-        decoder.add(AttentionDecoderCell(output_dim=code_dim, hidden_dim=code_dim, activation='tanh'))
-        decoder.add(LSTMDecoderCell(output_dim=code_dim, hidden_dim=code_dim, activation='linear'))
+        decoder.add(AttentionDecoderCell(output_dim=code_dim, hidden_dim=code_dim, 
+                                         activation='tanh'))
+        decoder.add(LSTMDecoderCell(output_dim=code_dim, hidden_dim=code_dim, 
+                                    activation='linear'))
         rnn = decoder(code)
 
     else:
-        rnn = AttentionDecoder(code_dim, code_dim, return_sequences=True, 
-                               unroll=True, activation='linear')(code)
+        raise ValueError, 'no such RNN method "{}"'.format(rnn)
         
     out = layers.Conv1D(output_dim, 1)(rnn)
     return models.Model(inp, out)
