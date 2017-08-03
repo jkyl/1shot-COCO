@@ -51,9 +51,8 @@ def read_classes(classes_json):
     _, classes = zip(*sorted(d.items(), key=lambda x: int(x[0])))
     return tf.train.input_producer(classes, shuffle=False).dequeue()
 
-def main(imgs_path, captions_json, classes_json, base_tfrecord, 
-         novel_tfrecord=None, lowshot_value=20, 
-         img_size=224, center_crop=True, truncate=False):
+def main(imgs_path, captions_json, classes_json, output_tfrecord, 
+         lowshot_value=20, img_size=224, center_crop=True, truncate=False):
     ''''''
     img_files = sorted(glob.glob(os.path.join(imgs_path, '*.jpg')))
     if truncate:
@@ -68,9 +67,8 @@ def main(imgs_path, captions_json, classes_json, base_tfrecord,
     print('got captions')
     class_op = read_classes(classes_json)
     print('got classes')
-    base = tf.python_io.TFRecordWriter(base_tfrecord)
-    if novel_tfrecord:
-        novel = tf.python_io.TFRecordWriter(novel_tfrecord)
+    record = tf.python_io.TFRecordWriter(output_tfrecord)
+    if lowshot_value:
         novel_classes = set([ 1, 23, 15, 46, 42, 56, 72, 17, 
                              60, 14, 61, 32, 30, 35, 58, 67,  
                               8, 71, 40,  2, 64, 52, 24, 27, 
@@ -91,18 +89,16 @@ def main(imgs_path, captions_json, classes_json, base_tfrecord,
                     'caption': _bytes_feature(caption.tostring()),
                     'class': _int64_feature(class_)
                 }))
-                if novel_tfrecord: 
+                if lowshot_value: 
                     if class_ in novel_classes:
                         if novel_counts[class_] < lowshot_value:
-                            novel.write(example.SerializeToString())
                             novel_counts[class_] += 1
+                            record.write(example.SerializeToString())
                     else:
-                        base.write(example.SerializeToString())
+                        record.write(example.SerializeToString())
                 else:
-                    base.write(example.SerializeToString())
-            base.close()
-            if novel_tfrecord:
-                novel.close()
+                    record.write(example.SerializeToString())
+            record.close()
         except:
             raise
     
@@ -113,9 +109,7 @@ if __name__== '__main__':
     p.add_argument('imgs_path', type=str)
     p.add_argument('captions_json', type=str)
     p.add_argument('classes_json', type=str)
-    p.add_argument('base_tfrecord', type=str)
-    p.add_argument('-nv', '--novel_tfrecord', type=str, default=None,
-        help='second output for novel classes')
+    p.add_argument('output_tfrecord', type=str)
     p.add_argument('-lv', '--lowshot_value', type=int, default=20,
         help='number of images per novel class')
     p.add_argument('-s', '--img_size', type=int, default=224,
