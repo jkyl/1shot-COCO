@@ -6,6 +6,7 @@ import threading
 import numpy as np
 import tensorflow as tf
 from inception_v3 import *
+from xception import *
 from tensorflow.contrib.keras import layers, models, backend, applications, losses
 from tensorflow.contrib.staging import StagingArea
 
@@ -122,15 +123,11 @@ class BaseModel(models.Model):
             if minus_ones:
                 return cap
             return tf.where(tf.less(cap, 0), (self.words-1)*tf.ones_like(cap), cap)
+        
         def per_batch_onehots(cap):
             cap = per_batch_inds(cap, minus_ones=False)
-            nonpad = tf.squeeze(tf.where(tf.greater(cap, -1)))
-            cap_nonpad = tf.gather(cap, nonpad)
-            eye = tf.eye(self.words, dtype=tf.float32)
-            onehot = tf.gather(eye, cap_nonpad)
-            padded = tf.pad(onehot, [[0, self.length-tf.shape(onehot)[0]], [0, 0]], 
-                            mode='CONSTANT')#, constant_values=0)
-            return padded
+            return tf.one_hot(cap, depth=self.words)
+        
         inds_mapped = tf.map_fn(per_batch_inds, caption, dtype=tf.int64)
         onehots_mapped = tf.map_fn(per_batch_onehots, caption, dtype=tf.float32)
         inds_mapped.set_shape((None, self.length))
@@ -174,20 +171,22 @@ def rnn_decoder(input_dim, length, code_dim, output_dim,
     out = layers.Conv1D(output_dim, 1, activation=activations[1])(rnn)
     return models.Model(inp, out)
 
-def spatial_attention_rnn(input_shape, length, code_dim, output_dim, rnn='LSTM'):
+def spatial_attention_rnn(input_shape, length, code_dim, output_dim, 
+                          z_dim=None, rnn='LSTM'):
     ''''''
     inp = code = layers.Input(shape=input_shape)
     if len(input_shape) > 1:
         code = layers.Flatten()(code)
         
-    code = layers.Dropout(0.3)(code)
     code = layers.RepeatVector(length)(code)
+    if z_dim:
+        code = layers.concatenate([code, tf.random_normal(shape=(length, z_dim))], axis=-1)
     input_dim = input_shape[-1]
     
     if rnn in ('LSTM', 'GRU'):
-        attn = Attn3D(code, length, code_dim)
-        rnn = layers.Bidirectional(eval('layers.'+rnn)(code_dim, return_sequences=True, 
-                    unroll=True, activation='linear'), merge_mode='concat')(attn)
+        rnn = eval('layers.'+rnn)(code_dim, return_sequences=True, 
+                                  recurrent_dropout=0.5,
+                                  unroll=True, activation='linear')(code)
         
     elif rnn == 'seq2seq':
         from recurrentshop import RecurrentSequential, RecurrentModel
@@ -206,16 +205,31 @@ def spatial_attention_rnn(input_shape, length, code_dim, output_dim, rnn='LSTM')
     out = layers.Conv1D(output_dim, 1)(rnn)
     return models.Model(inp, out)
     
-def cnn(input_shape, kind='xception', classes=None, weights=None, include_top=False, pooling='max'):
+def cnn(input_shape, kind='inception', pooling='max'):
     ''''''
     if kind == 'inception':
         return InceptionV3(input_shape=input_shape, 
-                           classes=classes, pooling=pooling,
-                           include_top=include_top, weights=weights)
-    elif kind == 'mobilenet':
-        return MobileNet(input_shape=input_shape, 
-                         classes=classes, pooling=pooling,
-                         include_top=include_top, weights=weights)
+                           classes=None, pooling=pooling,
+                           include_top=False, weights=None)
+    elif kind == 'xception':
+        return Xception(input_shape=input_shape, 
+                        classes=None, pooling=pooling,
+                        include_top=False, weights=None)
+    
+def rnn_discriminator(length, words, img_features, code_dim, rnn='LSTM'):
+    x = layers.Input((length, words))
+    c = layers.Input(img_features)
+    code = layers.Conv1D(code_dim, 1, activation='linear')(x)
+    if rnn in ('LSTM', 'GRU'):
+        rnn = eval('layers.'+rnn)(code_dim, return_sequences=False, 
+                                  unroll=True, activation='linear', 
+                                  recurrent_dropout=0.5)(code)
+    else:
+        raise ValueError, 'no such RNN method "{}"'.format(rnn)
+    merge = layers.concatenate([rnn, c])
+    dense = layers.Dense(1, activation='linear')(merge)
+    return models.Model([x, c], dense)
+    
     
 def Attn3D(inp, length, dim):
     '''

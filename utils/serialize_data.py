@@ -47,60 +47,61 @@ def read_captions(captions_json):
 
 def read_classes(classes_json):
     j = json.loads(open(classes_json).read())
-    d = {d['image_id']: d['category_id'] for d in j['annotations']}
+    d = {d['image_id']: int(d['category_id']) for d in j['annotations']}
     _, classes = zip(*sorted(d.items(), key=lambda x: int(x[0])))
     return tf.train.input_producer(classes, shuffle=False).dequeue()
 
 def main(imgs_path, captions_json, classes_json, output_tfrecord, 
-         lowshot_value=20, img_size=224, center_crop=True, truncate=False):
+         lowshot_value=None, img_size=299, center_crop=True, truncate=False):
     ''''''
-    img_files = sorted(glob.glob(os.path.join(imgs_path, '*.jpg')))
-    if truncate:
-        img_files = img_files[:truncate]
-    n = len(img_files)
-    print('found {} images'.format(n))
-    coord = tf.train.Coordinator()
-    print('made coord')
-    img_op = read_imgs(img_files, size=img_size, center_crop=center_crop)
-    print('got img tensor')
-    caption_op, vocab_size, length = read_captions(captions_json)
-    print('got captions')
-    class_op = read_classes(classes_json)
-    print('got classes')
-    record = tf.python_io.TFRecordWriter(output_tfrecord)
-    if lowshot_value:
-        novel_classes = set([ 1, 23, 15, 46, 42, 56, 72, 17, 
-                             60, 14, 61, 32, 30, 35, 58, 67,  
-                              8, 71, 40,  2, 64, 52, 24, 27, 
-                             63,  5, 79, 21, 37, 74, 49, 70, 
-                             53, 45, 65, 16, 75,  9, 41, 26])
-        novel_counts = dict(zip(list(novel_classes), [0]*40))
-    print('starting')
-    with tf.Session() as sess:
-        tf.train.start_queue_runners(sess=sess, coord=coord)
-        try:
-            for _ in tqdm.trange(n):
-                img, caption, class_ = sess.run([img_op, caption_op, class_op])
-                example = tf.train.Example(features=tf.train.Features(feature={
-                    'image_size': _int64_feature(img_size),
-                    'vocab_size': _int64_feature(vocab_size),
-                    'length': _int64_feature(length),
-                    'image': _bytes_feature(img),
-                    'caption': _bytes_feature(caption.tostring()),
-                    'class': _int64_feature(class_)
-                }))
-                if lowshot_value: 
-                    if class_ in novel_classes:
-                        if novel_counts[class_] < lowshot_value:
-                            novel_counts[class_] += 1
+    with tf.device('/CPU:0'):
+        img_files = sorted(glob.glob(os.path.join(imgs_path, '*.jpg')))
+        if truncate:
+            img_files = img_files[:truncate]
+        n = len(img_files)
+        print('found {} images'.format(n))
+        coord = tf.train.Coordinator()
+        print('made coord')
+        img_op = read_imgs(img_files, size=img_size, center_crop=center_crop)
+        print('got img tensor')
+        caption_op, vocab_size, length = read_captions(captions_json)
+        print('got captions')
+        class_op = read_classes(classes_json)
+        print('got classes')
+        record = tf.python_io.TFRecordWriter(output_tfrecord)
+        if lowshot_value:
+            novel_classes = set([ 1, 23, 15, 46, 42, 56, 72, 17, 
+                                 60, 14, 61, 32, 30, 35, 58, 67,  
+                                  8, 71, 40,  2, 64, 52, 24, 27, 
+                                 63,  5, 79, 21, 37, 74, 49, 70, 
+                                 53, 45, 65, 16, 75,  9, 41, 26])
+            novel_counts = dict(zip(list(novel_classes), [0]*40))
+        print('starting')
+        with tf.Session() as sess:
+            tf.train.start_queue_runners(sess=sess, coord=coord)
+            try:
+                for i in tqdm.trange(n):
+                    img, caption, class_ = sess.run([img_op, caption_op, class_op])
+                    example = tf.train.Example(features=tf.train.Features(feature={
+                        'image_size': _int64_feature(img_size),
+                        'vocab_size': _int64_feature(vocab_size),
+                        'length': _int64_feature(length),
+                        'image': _bytes_feature(img),
+                        'caption': _bytes_feature(caption.tostring()),
+                        'class': _int64_feature(class_)
+                    }))
+                    if lowshot_value: 
+                        if class_ in novel_classes:
+                            if novel_counts[class_] < lowshot_value:
+                                novel_counts[class_] += 1
+                                record.write(example.SerializeToString())
+                        else:
                             record.write(example.SerializeToString())
                     else:
                         record.write(example.SerializeToString())
-                else:
-                    record.write(example.SerializeToString())
-            record.close()
-        except:
-            raise
+                record.close()
+            except:
+                raise
     
 if __name__== '__main__':
     import argparse
@@ -110,7 +111,7 @@ if __name__== '__main__':
     p.add_argument('captions_json', type=str)
     p.add_argument('classes_json', type=str)
     p.add_argument('output_tfrecord', type=str)
-    p.add_argument('-lv', '--lowshot_value', type=int, default=20,
+    p.add_argument('-lv', '--lowshot_value', type=int, default=None,
         help='number of images per novel class')
     p.add_argument('-s', '--img_size', type=int, default=224,
         help='sidelength of images')
