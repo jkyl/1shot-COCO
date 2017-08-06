@@ -202,7 +202,7 @@ class TextGen(BaseModel):
             # mismatch, xentropy, and weight regularizer
             L_m = self.L_adv(x_train, tf.random_shuffle(y_train), 0)
             L_x = self.xent(x_train, y_train)
-            L_r = self.weight_norm(self.gen.trainable_weights)
+            L_r = self.weight_norm(G_vars)
 
             # total discriminator loss
             L_D = L_ff + L_rr + lambda_m*L_m
@@ -330,9 +330,9 @@ class TextGen(BaseModel):
                                     {learning: False})
                                 st = 'Loss: {}\nReal: "{}"\nFake: "{}"\n'\
                                      .format(lxv, rst, fst)\
-                                     .replace('SOS', '').replace('EOS', '')
-                                print(rst, file=open(txtfile, 'a'))
-                                summary_writer.add_summary(smry, n)
+                                     .replace('SOS ', '').replace(' EOS', '')
+                                print(st, file=open(txtfile, 'a'))
+                                summary_writer.add_summary(sm, n)
                                 summary_writer.flush()
 
                             # save checkpoint
