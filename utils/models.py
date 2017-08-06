@@ -5,10 +5,8 @@ import time
 import threading
 import numpy as np
 import tensorflow as tf
-from inception_v3 import *
-from xception import *
-from tensorflow.contrib.keras import layers, models, backend, applications, losses
 from tensorflow.contrib.staging import StagingArea
+from tensorflow.contrib.keras import layers, models, backend, applications
 
 __author__ = 'Jonathan Kyl'
 
@@ -72,7 +70,8 @@ class BaseModel(models.Model):
             raise
         return stage_stop, stage_threads
 
-    def make_summary(self, output_path, img_dict={}, scalar_dict={}, text_dict={}, n_images=5):
+    def make_summary(self, output_path, img_dict={},
+                     scalar_dict={}, text_dict={}, n_images=1):
         ''''''
         summaries = []
         for k, v in img_dict.items():
@@ -112,7 +111,7 @@ class BaseModel(models.Model):
         ''''''
         def per_batch_inds(cap, minus_ones=False, random=random):
             if random:
-                start = cap[:, 1]
+                start = cap[:, 2]
                 good = tf.where(tf.greater(start, -1))
                 rand = good[tf.random_uniform(minval=0, maxval=tf.shape(good)[0], 
                                               shape=[], dtype=tf.int32)]
@@ -133,109 +132,69 @@ class BaseModel(models.Model):
         onehots_mapped.set_shape((None, self.length, self.words))
         return onehots_mapped, inds_mapped
     
-def create_table(inds_to_words_json):
-    return tf.Variable(zip(*sorted(json.loads(open(inds_to_words_json)\
-        .read()).items(), key=lambda x: int(x[0])))[1])
+    def create_table(self, inds_to_words_json):
+        ''''''
+        return tf.Variable(zip(*sorted(json.loads(open(inds_to_words_json)\
+                           .read()).items(), key=lambda x: int(x[0])))[1])
     
-def postproc_caption(caption, table):
-    captions = tf.unstack(caption)
-    strings = tf.gather(table, caption)
-    return tf.reduce_join(strings, axis=[1], separator=' ')
+    def postproc_caption(self, captions, table):
+        ''''''
+        captions = tf.argmax(captions, axis=-1)
+        captions = tf.unstack(captions)
+        strings = tf.gather(table, captions)
+        return tf.reduce_join(strings, axis=[1], separator=' ')
 
-def clip_gradients_by_norm(grads_and_vars, clip_gradients):
-    """Clips gradients by global norm."""
-    gradients, variables = zip(*grads_and_vars)
-    clipped_gradients, _ = tf.clip_by_global_norm(gradients, clip_gradients)
-    return list(zip(clipped_gradients, variables))
+    def clip_gradients_by_norm(self, grads_and_vars, clip_gradients):
+        ''''''
+        g, v = zip(*grads_and_vars)
+        clipped, _ = tf.clip_by_global_norm(g, clip_gradients)
+        return list(zip(clipped, v))
 
-def SELU(x):
+    
+# # # # # # # # # # # # # # # # # # 
+# END OF BASE MODEL CLASS METHODS #
+# ------------------------------- #
+#      START OF KERAS MODELS      #
+# # # # # # # # # # # # # # # # # #
+
+
+def cnn(input_shape, kind='InceptionV3', pooling='max'):
     ''''''
-    alpha = 1.6732632423543772848170429916717
-    scale = 1.0507009873554804934193349852946
-    return scale * layers.ELU(alpha=alpha)(x)
-
-def rnn_decoder(input_dim, length, code_dim, output_dim, 
-                rnn='LSTM', activations=['linear', 'linear']):
-    
-    for i, a in enumerate(activations):
-        if a == 'selu': activations[i] = SELU
-    
-    inp = layers.Input(shape=(input_dim,), name='lstm_input')
-    def repeat_timedim(x):
-        x = tf.expand_dims(x, 1)
-        return tf.tile(x, [1, length, 1])
-    rep = layers.Lambda(repeat_timedim)(inp)
-    rnn = eval('layers.'+rnn)(code_dim, return_sequences=True, 
-                unroll=True, activation=activations[0])(rep)
-    out = layers.Conv1D(output_dim, 1, activation=activations[1])(rnn)
-    return models.Model(inp, out)
-
-def spatial_attention_rnn(input_shape, length, code_dim, output_dim, 
-                          z_dim=None, rnn='LSTM'):
-    ''''''
-    inp = code = layers.Input(shape=input_shape)
-    if len(input_shape) > 1:
-        code = layers.Flatten()(code)
-        
-    code = layers.RepeatVector(length)(code)
-    if z_dim:
-        code = layers.concatenate([code, tf.random_normal(shape=(length, z_dim))], axis=-1)
-    input_dim = input_shape[-1]
-    
-    if rnn in ('LSTM', 'GRU'):
-        rnn = eval('layers.'+rnn)(code_dim, return_sequences=True, 
-                                  recurrent_dropout=0.5,
-                                  unroll=True, activation='linear')(code)
-        
-    elif rnn == 'seq2seq':
-        from recurrentshop import RecurrentSequential, RecurrentModel
-        from seq2seq.cells import LSTMDecoderCell, AttentionDecoderCell
-        decoder = RecurrentSequential(decode=True, output_length=length,
-                                      unroll=True, stateful=False)
-        decoder.add(AttentionDecoderCell(output_dim=code_dim, hidden_dim=code_dim, 
-                                         activation='tanh'))
-        decoder.add(LSTMDecoderCell(output_dim=code_dim, hidden_dim=code_dim, 
-                                    activation='linear'))
-        rnn = decoder(code)
-
+    if kind in ('InceptionV3', 'Xception'):
+        cnn = eval('applications.'+kind)
     else:
-        raise ValueError, 'no such RNN method "{}"'.format(rnn)
-        
-    out = layers.Conv1D(output_dim, 1)(rnn)
-    return models.Model(inp, out)
+        raise ValueError, 'no such CNN method "{}"'.format(kind)
+    return cnn(input_shape=input_shape, classes=None,
+               pooling=pooling, include_top=False, weights=None)
     
-def cnn(input_shape, kind='inception', pooling='max'):
+def rnn_generator(static_dim, sequence_dim, length, code_dim, kind='LSTM'):
     ''''''
-    if kind == 'inception':
-        return InceptionV3(input_shape=input_shape, 
-                           classes=None, pooling=pooling,
-                           include_top=False, weights=None)
-    elif kind == 'xception':
-        return Xception(input_shape=input_shape, 
-                        classes=None, pooling=pooling,
-                        include_top=False, weights=None)
-    
-def rnn_discriminator(length, words, img_features, code_dim, rnn='LSTM'):
-    x = layers.Input((length, words))
-    c = layers.Input(img_features)
-    code = layers.Conv1D(code_dim, 1, activation='linear')(x)
-    if rnn in ('LSTM', 'GRU'):
-        rnn = eval('layers.'+rnn)(img_features[0], return_sequences=False, 
-                                  unroll=True, activation='linear', 
-                                  recurrent_dropout=0.5)(code)
+    if kind in ('LSTM', 'GRU'):
+        rnn = eval('layers.'+kind)
     else:
-        raise ValueError, 'no such RNN method "{}"'.format(rnn)
-    def dot(l):
-        return tf.reduce_sum(l[0]*l[1], axis=-1)
-    dot = layers.Lambda(dot)([rnn, c])
-    return models.Model([x, c], dot)
+        raise ValueError, 'no such RNN method "{}"'.format(kind)
+    static = layers.Input((static_dim,))
+    repeat = layers.RepeatVector(length)(static)
+    sequence = layers.Input((length, sequence_dim))
+    sequence_emb = layers.Dense(static_dim)(sequence)
+    code = layers.add([repeat, sequence_emb])
+    emb = rnn(code_dim, recurrent_dropout=0.5, unroll=True,
+              return_sequences=True, activation='linear')(code)
+    out = layers.Conv1D(sequence_dim, 1)(emb)
+    return models.Model([static, sequence], out)
     
-def Attn3D(inp, length, dim):
-    '''
-    https://github.com/philipperemy/keras-attention-mechanism/blob/master/attention_lstm.py
-    '''
-    x = layers.Permute((2, 1))(inp)
-    x = layers.Reshape((dim, length))(x)
-    x = layers.Dense(length, activation='softmax')(x)
-    x = layers.Permute((2, 1))(x)
-    return layers.multiply([inp, x])
+def rnn_discriminator(static_dim, sequence_dim, length, code_dim, kind='LSTM'):
+    ''''''
+    if kind in ('LSTM', 'GRU'):
+        rnn = eval('layers.'+kind)
+    else:
+        raise ValueError, 'no such RNN method "{}"'.format(kind)
+    static = layers.Input((static_dim,))
+    sequence = layers.Input((length, sequence_dim))
+    code = layers.Dense(code_dim)(sequence)
+    emb = rnn(static_dim, recurrent_dropout=0.5, unroll=True,
+              return_sequences=False, activation='linear')(code)
+    out = layers.Lambda(lambda l:
+              tf.reduce_sum(l[0]*l[1], axis=-1))([emb, static])
+    return models.Model([static, sequence], out)
+
