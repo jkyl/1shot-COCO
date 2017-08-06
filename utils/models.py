@@ -49,7 +49,7 @@ class BaseModel(models.Model):
             SA = StagingArea(dtypes, shapes=shapes, capacity=capacity)
             return SA.get(), SA.size(), SA.put(batch)
     
-    def start_threads(self, sess, coord, put_op, n_stage_threads=4):
+    def start_threads(self, sess, put_op, n_stage_threads=4):
         ''''''        
         stage_threads = []
         stage_stop = threading.Event()
@@ -70,7 +70,6 @@ class BaseModel(models.Model):
         except:
             stage_stop.set()
             raise
-        tf.train.start_queue_runners(sess=sess, coord=coord)
         return stage_stop, stage_threads
 
     def make_summary(self, output_path, img_dict={}, scalar_dict={}, text_dict={}, n_images=5):
@@ -221,15 +220,15 @@ def rnn_discriminator(length, words, img_features, code_dim, rnn='LSTM'):
     c = layers.Input(img_features)
     code = layers.Conv1D(code_dim, 1, activation='linear')(x)
     if rnn in ('LSTM', 'GRU'):
-        rnn = eval('layers.'+rnn)(code_dim, return_sequences=False, 
+        rnn = eval('layers.'+rnn)(img_features[0], return_sequences=False, 
                                   unroll=True, activation='linear', 
                                   recurrent_dropout=0.5)(code)
     else:
         raise ValueError, 'no such RNN method "{}"'.format(rnn)
-    merge = layers.concatenate([rnn, c])
-    dense = layers.Dense(1, activation='linear')(merge)
-    return models.Model([x, c], dense)
-    
+    def dot(l):
+        return tf.reduce_sum(l[0]*l[1], axis=-1)
+    dot = layers.Lambda(dot)([rnn, c])
+    return models.Model([x, c], dot)
     
 def Attn3D(inp, length, dim):
     '''

@@ -9,38 +9,45 @@ from utils.models import *
 __author__ = 'Jonathan Kyl'
 
 class TextGen(BaseModel):
-    def __init__(self, img_size=224, 
-                 code_dim=128, 
+    def __init__(self, 
+                 img_size=299, 
+                 code_dim=1024, 
                  length=20, 
                  words=9412, 
-                 pooling=None, rnn='LSTM'):
+                 cnn_type='inception',
+                 pooling=None,
+                 rnn_type='LSTM'):
         ''''''
         self.img_size = img_size
         self.length = length
         self.words = words
         self.code_dim = code_dim
         
-        with tf.variable_scope('ImgFeat'):
+        # build image feature extractor
+        with tf.variable_scope('CNN'):
             self.phi = cnn(
                 input_shape=(img_size, img_size, 3),
-                kind='inception', 
+                kind=cnn_type, 
                 pooling=pooling)
             self.phi_dim = self.phi.output_shape[1:]
 
+        # build text generator
         with tf.variable_scope('TextGen'):
             self.gen = spatial_attention_rnn(
                 input_shape=self.phi_dim, 
                 length=length, 
                 code_dim=code_dim,
                 output_dim=words, 
-                rnn=rnn)
+                rnn=rnn_type)
             
+        # build text discriminator
         with tf.variable_scope('TextDisc'):
             self.disc = rnn_discriminator(
                 length=length, words=words, 
                 img_features=self.phi_dim,
                 code_dim=code_dim, rnn=rnn)
 
+        # inherit as one model
         super(BaseModel, self).__init__(
             self.phi.inputs + self.gen.inputs + self.disc.inputs,
             self.phi.outputs + self.gen.outputs + self.disc.outputs)
@@ -53,56 +60,96 @@ class TextGen(BaseModel):
         ''''''
         return self.disc([y, self.phi(x)])
     
-    def L(self, y, x, label):
+    def L_adv(self, y, x, label):
+        ''''''
         pred = self.D(y, x)
-        return tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-            labels=label*tf.ones_like(pred), logits=pred))
+        return tf.reduce_mean(
+            tf.nn.sigmoid_cross_entropy_with_logits(
+                labels=label*tf.ones_like(pred), 
+                logits=pred))
     
-    def xent(self, y, x):
+    def xent(self, y_inds, x):
+        ''''''
         pred = self.G(x)
-        return tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(
-            labels=y, logits=pred))
+        return tf.reduce_mean(
+            tf.nn.sparse_softmax_cross_entropy_with_logits(
+                labels=y_inds, 
+                logits=pred))
+    
+    def weight_norm(self, weights):
+        ''''''
+        return tf.reduce_sum([tf.reduce_sum(w**2) for w in weights])
     
     def train(self, 
               train_record, 
               val_record,
               output_path,
-              lambda_m=1,
-              lambda_x=1,
-              lambda_d=1,
-              clip_gradients=False,
-              batch_size=16, 
+              batch_size=16,
+              optimizer='adam',
               lr_init=1e-4, 
+              decay_every=250000,
               g_updates=1, 
-              cnn_trainable=True,
+              d_updates=0,
+              clip_gradients=5.0,
+              lambda_x=1,
+              lambda_r=0.001,
+              lambda_d=0,
+              lambda_m=0,
+              cnn_trainable=False,
               random_captions=True,
-              n_read_threads=4,
-              n_stage_threads=2,
+              n_read_threads=6,
+              n_stage_threads=6,
               capacity=16,
-              epoch_size=100,
+              epoch_size=10000,
+              save_every=10000,
               validate_every=100,
-              save_every=1000,
-              decay_every=np.inf,
-              cnn_ckpt='pretrained/inception_v3_weights.h5',
               ckpt=None,
-              inds_to_words_json='/home/paperspace/data/ms_coco/preproc/preproc_vocab-9412_threshold-5_length-20/inds_to_words.json'):
+              cnn_ckpt='pretrained/inception_v3_weights.h5',
+              inds_to_words_json='/home/paperspace/data/ms_coco/preproc/preproc_vocab-9412_threshold-5_length-20/inds_to_words.json',
+             ):
         '''''' 
         
         with tf.variable_scope('BatchReader'):
             print('creating batch reader')
             
             coord =  tf.train.Coordinator()
-            x_train, y_train, _ = self.read_tfrecord(train_record, 
-                batch_size=batch_size, capacity=capacity, n_threads=n_read_threads)
+            
+            # read and preprocess training records
+            x_train, y_train, cls_train = self.read_tfrecord(
+                train_record, 
+                batch_size=batch_size, 
+                capacity=capacity, 
+                n_threads=n_read_threads)
             x_train = self.preproc_img(x_train)
-            y_train, _ = self.preproc_caption(y_train, random=random_captions)
+            y_train_onehots, y_train_inds = self.preproc_caption(
+                y_train, random=random_captions)
+            
+            # read and preprocess validation records
+            x_val, y_val, cls_val = self.read_tfrecord(
+                val_record, 
+                batch_size=batch_size, 
+                capacity=1, 
+                n_threads=1)
+            x_val = self.preproc_img(x_val)
+            y_val_onehots, y_val_inds = self.preproc_caption(
+                y_val, random=random_captions)
         
         with tf.variable_scope('StagingArea'):
             print('creating staging area')
 
-            get, SA_size, put_op = self.stage_data(
-                [x_train, y_train], capacity=capacity)
-            x_train, y_train = get
+            # create training queue on GPU
+            train_get, train_size, train_put = self.stage_data(
+                [x_train, y_train_onehots, y_train_inds],
+                capacity=capacity)
+            x_train, y_train_onehots, y_train_inds = train_get
+            
+            # create validation queue on GPU
+            val_get, val_size, val_put = self.stage_data(
+                [x_val, y_val_onehots, y_val_inds], 
+                capacity=1)
+            x_val, y_val_onehots, y_val_inds = val_get
+            
+            # global step and learning phase flag
             step = tf.Variable(0, name='step')
             update_step = tf.assign_add(step, 1)
             learning = backend.learning_phase()
@@ -110,20 +157,50 @@ class TextGen(BaseModel):
         with tf.variable_scope('Optimizer'):
             print('creating optimizer')
 
+            # get variables
             D_vars = self.disc.trainable_variables
             G_vars = self.gen.trainable_variables
             if cnn_trainable:
                 G_vars += self.phi.trainable_variables
                 
+            # the generated caption
             y_hat = self.G(x_train)
-            L_m = self.L(tf.random_shuffle(y_train), x_train, 0)
-            L_x = self.xent(y_train, x_train)
-            L_D = self.L(y_train, x_train, 1) + self.L(y_hat, x_train, 0) + lambda_m*L_m
-            L_G = lambda_d*self.L(y_hat, x_train, 1) + lambda_x*L_x
+            
+            # define loss terms:
+            # fake as fake, fake as real, and real as real
+            L_ff = self.L_adv(y_hat, x_train, 0)
+            L_fr = self.L_adv(y_hat, x_train, 1)            
+            L_rr = self.L_adv(y_train_onehots, x_train, 1)
+            
+            # mismatch, xentropy, and weight regularizer
+            L_m = self.L_adv(tf.random_shuffle(y_train_onehots), x_train, 0)
+            L_x = self.xent(y_train_inds, x_train)
+            L_r = self.weight_norm(self.gen.trainable_weights)
+
+            # total discriminator loss
+            L_D = L_ff + L_rr + lambda_m*L_m
+                
+            # total generator loss
+            L_G = lambda_d*L_fr \
+                + lambda_x*L_x \
+                + lambda_r*L_r 
                               
+            # learning rate with periodic halving
             lr = lr_init * 0.5**tf.floor(tf.cast(step, tf.float32) / decay_every)
-            D_opt = tf.train.AdamOptimizer(lr, beta1=0.5).minimize(L_D, var_list=D_vars)
-            G_opt = tf.train.AdamOptimizer(lr, beta1=0.5)
+                
+            # optimizer(s): one of {adam, sgd}
+            if optimizer == 'adam':
+                G_opt = tf.train.AdamOptimizer(lr, beta1=0.5)
+                if d_updates: D_opt = tf.train.AdamOptimizer(lr, beta1=0.5)\
+                                      .minimize(L_D, var_list=D_vars)
+            elif optimizer == 'sgd':
+                G_opt = tf.train.GradientDescentOptimizer(lr)
+                if d_updates: D_opt = tf.train.GradientDescentOptimizer(lr)\
+                                      .minimize(L_D, var_list=D_vars)
+            else:
+                raise ValueError, 'optimizer can be "adam" or "sgd"'
+            
+            # rescale by L2 norm, if specified
             G_grad = G_opt.compute_gradients(L_G, var_list=G_vars)
             if clip_gradients:
                 G_grad = clip_gradients_by_norm(G_grad, clip_gradients)
@@ -131,41 +208,57 @@ class TextGen(BaseModel):
 
         with tf.variable_scope('Summary'):
             print('creating summary')
-
-            x_val, y_val, _ = self.read_tfrecord(val_record, 
-                batch_size=batch_size, n_threads=1)
             
-            x_val = self.preproc_img(x_val)
-            y_val, _ = self.preproc_caption(y_val, random=random_captions)
+            # validation caption
             y_hat_val = self.G(x_val)
             
-            L_d_val = self.L(y_hat_val, x_val, 1)
-            L_m_val = self.L(tf.random_shuffle(y_val), x_val, 0)
-            L_x_val = self.xent(y_val, x_val)
+            # validation loss terms
+            L_ff_val = self.L_adv(y_hat_val, x_val, 0)
+            L_fr_val = self.L_adv(y_hat_val, x_val, 1)
+            L_rr_val = self.L_adv(y_val_onehots, x_val, 1)
+            L_m_val = self.L_adv(tf.random_shuffle(y_val_onehots), x_val, 0)
+            L_x_val = self.xent(y_val_inds, x_val)
+            L_D_val = L_ff_val + L_rr_val + lambda_m*L_m_val
+            L_G_val = lambda_d*L_fr_val \
+                    + lambda_x*L_x_val \
+                    + lambda_r*L_r 
             
+            # decode predictions back to words
             table = create_table(inds_to_words_json)
-            real_str = postproc_caption(tf.argmax(y_val, axis=-1), table)
-            gen_str = postproc_caption(tf.argmax(y_hat_val, axis=-1), table)
+            real_str = postproc_caption(y_val_inds, table)[0]
+            gen_str = postproc_caption(tf.argmax(y_hat_val, axis=-1), table)[0]
+            txtfile = os.path.join(output_path, 'output.txt')
 
-            scalar_dict = {'L_d': L_d_val, 
+            # associate scalars with display names
+            scalar_dict = {'L_ff': L_ff_val, 
+                           'L_fr': L_fr_val,
+                           'L_rr': L_rr_val,
                            'L_m': L_m_val,
                            'L_x': L_x_val,
-                           'SA_size': SA_size, 
+                           'L_D': L_D_val,
+                           'L_G': L_G_val,
+                           'L_r': L_r,
+                           'SA_size': train_size, 
                            'lr': lr}
-            text_dict={'real': real_str, 'gen': gen_str}
+        
+        # summarize 
         summary_op, summary_writer = self.make_summary(
-            output_path, scalar_dict=scalar_dict, text_dict=text_dict)
+            output_path, scalar_dict=scalar_dict)
 
+        # start the session 
         with tf.Session(graph=self.graph) as sess:
             
             print('starting threads')
-            stage_stop, stage_threads = self.start_threads(
-                sess, coord, put_op, n_stage_threads=n_stage_threads)
+            tf.train.start_queue_runners(sess=sess, coord=coord)
+            train_stop, train_threads = self.start_threads(
+                sess, train_put, n_stage_threads=n_stage_threads)
+            val_stop, val_threads = self.start_threads(
+                sess, val_put, n_stage_threads=1)
             
             print('initializing variables')
             sess.run(tf.global_variables_initializer())
             
-            if save_every != np.inf:
+            if save_every < np.inf:
                 print('saving weights')
                 self.save_h5(output_path, 0)
                 
@@ -181,61 +274,52 @@ class TextGen(BaseModel):
             self.graph.finalize()
             try:
                 epoch = 1
-                while True:
-                    print('epoch: ' + str(epoch)); time.sleep(0.2)
+                while True:                    
+                    print('epoch: ' + str(epoch))
+                    time.sleep(0.2)
+                    epoch += 1
+                    
                     for _ in tqdm.trange(epoch_size, disable=False):
-                        if not (coord.should_stop() or stage_stop.is_set()):
+                        if not (coord.should_stop() 
+                            or train_stop.is_set() 
+                            or val_stop.is_set()):
 
                             # update discriminator
-                            _, n = sess.run([D_opt, update_step], 
-                                            {learning: True})
+                            for _ in range(d_updates):
+                                sess.run(D_opt, {learning: True})
                             
                             # update generator  
                             for _ in range(g_updates):
-                                sess.run(G_opt, {learning: True})
+                                sess.run(G_opt, {learning: True})                                
+                            
+                            # update global step
+                            n = sess.run(update_step)
 
                             # validate
                             if n % validate_every == 1:
                                 smry, rst, gst = sess.run(
                                     [summary_op, real_str, gen_str],
                                     {learning: False})
-                                print(rst[0])
-                                print(gst[0])
+                                rst = 'Real: "{}"\n'.format(rst)
+                                rst += 'Fake: "{}"\n'.format(gst)
+                                print(rst, file=open(txtfile, 'a'))
                                 summary_writer.add_summary(smry, n)
                                 summary_writer.flush()
 
                             # write checkpoint
                             if n % save_every == 0:
                                 self.save_h5(output_path, n)
-                    epoch += 1
+                        else:
+                            raise IOError, 'queues closed'
+                            
+            # exit behaviour: request thread stop and wait for 
+            # them to recieve message before exiting session context
             except:
                 coord.request_stop()
-                stage_stop.set()
+                train_stop.set()
+                val_stop.set()
+                time.sleep(0.2)
                 raise
-                
-    def infer(self, ckpt, val_tfrecord, output_path, n=1,
-              inds_to_words_json='',
-              batch_size=16, 
-              n_threads=4):
-        ''''''
-        with tf.variable_scope('Inference'):
-            table = create_table(inds_to_words_json)
-            coord = tf.train.Coordinator()
-            x_val, _, _ = self.read_tfrecord(val_tfrecord, 
-                batch_size=batch_size, n_threads=n_threads)
-            x_val = self.preproc_img(x_val)
-            y_hat = self.G(x_val)
-            y_hat_inds = tf.argmax(y_hat, axis=-1)
-            strings = postproc_caption(y_hat_inds, table)
-
-        with tf.Session() as sess:
-            tf.train.start_queue_runners(sess=sess, coord=coord)
-            sess.run(tf.global_variables_initializer())
-            self.load_weights(ckpt)
-            rv = []
-            for i in tqdm.trange(n):
-                rv.append(sess.run([x_val, strings], {backend.learning_phase(): False}))
-            return rv
                 
 if __name__ == '__main__':
     import argparse
