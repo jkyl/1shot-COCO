@@ -111,7 +111,6 @@ class TextGen(BaseModel):
               clip_gradients=5.0,
               lambda_x=1,
               lambda_r=0.001,
-              lambda_d=0,
               lambda_g=0,
               cnn_trainable=False,
               random_captions=True,
