@@ -12,12 +12,14 @@ __author__ = 'Jonathan Kyl'
 
 class BaseModel(models.Model):
     ''''''
-    def read_tfrecord(self, tfrecord, batch_size=64, capacity=8, n_threads=4):
+    def read_tfrecord(self, tfrecord, batch_size=64, capacity=8, 
+                      n_threads=4, n_epochs=None):
         ''''''
         with tf.device('/cpu:0'):
             reader = tf.TFRecordReader()
             _, serialized_example = reader.read(
-                tf.train.string_input_producer([tfrecord], shuffle=True))
+                tf.train.string_input_producer([tfrecord], shuffle=True, 
+                                               num_epochs=n_epochs))
             feature = {
                 'image': tf.FixedLenFeature([], tf.string),
                 'caption': tf.FixedLenFeature([], tf.string),
@@ -151,11 +153,11 @@ class BaseModel(models.Model):
         return list(zip(clipped, v))
 
     
-# # # # # # # # # # # # # # # # # # 
-# END OF BASE MODEL CLASS METHODS #
-# ------------------------------- #
-#      START OF KERAS MODELS      #
-# # # # # # # # # # # # # # # # # #
+    # # # # # # # # # # # # # # # # # # 
+    # END OF BASE MODEL CLASS METHODS #
+    # ------------------------------- #
+    #      START OF KERAS MODELS      #
+    # # # # # # # # # # # # # # # # # #
 
 
 def cnn(input_shape, kind='InceptionV3', pooling='max'):
@@ -176,25 +178,22 @@ def rnn_generator(static_dim, sequence_dim, length, code_dim, kind='LSTM'):
     static = layers.Input((static_dim,))
     repeat = layers.RepeatVector(length)(static)
     sequence = layers.Input((length, sequence_dim))
-    sequence_emb = layers.Dense(static_dim)(sequence)
-    code = layers.add([repeat, sequence_emb])
+    sequence_emb = layers.Conv1D(static_dim, 1)(sequence)
+    code = layers.concatenate([repeat, sequence_emb])
     emb = rnn(code_dim, recurrent_dropout=0.5, unroll=True,
               return_sequences=True, activation='linear')(code)
     out = layers.Conv1D(sequence_dim, 1)(emb)
     return models.Model([static, sequence], out)
     
-def rnn_discriminator(static_dim, sequence_dim, length, code_dim, kind='LSTM'):
+def rnn_discriminator(sequence_dim, length, code_dim, kind='LSTM'):
     ''''''
     if kind in ('LSTM', 'GRU'):
         rnn = eval('layers.'+kind)
     else:
         raise ValueError, 'no such RNN method "{}"'.format(kind)
-    static = layers.Input((static_dim,))
     sequence = layers.Input((length, sequence_dim))
-    code = layers.Dense(code_dim)(sequence)
-    emb = rnn(static_dim, recurrent_dropout=0.5, unroll=True,
-              return_sequences=False, activation='linear')(code)
-    out = layers.Lambda(lambda l:
-              tf.reduce_sum(l[0]*l[1], axis=-1))([emb, static])
-    return models.Model([static, sequence], out)
+    emb = rnn(code_dim, recurrent_dropout=0.5, unroll=True,
+              return_sequences=False, activation='linear')(sequence)
+    out = layers.Dense(1)(emb)
+    return models.Model(sequence, out)
 

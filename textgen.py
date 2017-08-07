@@ -43,53 +43,40 @@ class TextGen(BaseModel):
                 length=length, 
                 code_dim=code_dim,
                 kind=rnn_type)
-            
-        # build text discriminator
-        with tf.variable_scope('TextDisc'):
-            self.disc = rnn_discriminator(
-                static_dim=self.phi_dim,
-                sequence_dim=words,
-                length=length, 
-                code_dim=code_dim,
-                kind=rnn_type)
-
+        
         # inherit as one model
         super(BaseModel, self).__init__(
-            self.phi.inputs + self.gen.inputs + self.disc.inputs,
-            self.phi.outputs + self.gen.outputs + self.disc.outputs)
+            self.phi.inputs + self.gen.inputs, # + self.disc.inputs,
+            self.phi.outputs + self.gen.outputs) # + self.disc.outputs)
 
 
     def G(self, x, y):
         '''generate next words given previous words and image'''
         return self.gen([self.phi(x), y])
     
-    def D(self, x, y):
-        '''discriminator logits on words given image'''
-        return self.disc([self.phi(x), y])
+    def D(self, y):
+        '''discriminator logits on words'''
+        return self.disc(y)
     
-    def L_adv(self, x, y, labels):
+    def L_adv(self, y):
         '''discriminator loss against real/fake labels'''
-        pred = self.D(x, y)
-        labels *= tf.ones_like(pred)
-        return tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-                labels=labels, logits=pred))
-    
+        return tf.reduce_mean(self.D(y))
+        
     def xent(self, x, y):
         '''logistic loss between generated and real next words'''
         pred = self.G(x, y)
         y_inds = tf.argmax(y, axis=-1)
         labels = tf.concat([y_inds[:, 1:], y_inds[:, -1:]], axis=-1)
-        return tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(
+        return tf.reduce_mean(
+            tf.nn.sparse_softmax_cross_entropy_with_logits(
                 labels=labels, logits=pred))
     
     def weight_norm(self, weights):
         '''L2 weight regularizer'''
         return tf.reduce_sum([tf.reduce_sum(w**2) for w in weights])
 
-    def sample_recursively(self, x):
-        '''
-        TBD: differentiable?
-        '''
+    def sample_recursively(self, x, continuous=False):
+        ''''''
         # predict the first word given a "start" token
         bs = tf.shape(x)[0]
         y_hat = np.zeros((1, self.length, self.words))
@@ -100,12 +87,16 @@ class TextGen(BaseModel):
         # append most likely word given previous word(s) to next round's input
         for t in range(self.length-1):
             g = self.G(x, y_hat)
-            m = tf.reduce_max(g[:, t], axis=-1)
-            m = tf.expand_dims(tf.expand_dims(m,  -1), -1)
-            pred = tf.where(
-                tf.equal(g-m, 0), tf.ones_like(g), tf.zeros_like(g))
+            if continuous:
+                pred = layers.Activation('softmax')(g)
+            else:
+                m = tf.reduce_max(g[:, t], axis=-1)
+                m = tf.expand_dims(tf.expand_dims(m,  -1), -1)
+                pred = tf.where(
+                    tf.equal(g-m, 0), tf.ones_like(g), tf.zeros_like(g))
             pred = tf.concat(
-                [tf.zeros((bs, t+1, self.words)), pred[:, t:-1]], axis=-2)
+                [tf.zeros((bs, t+1, self.words)), pred[:, t:t+1], 
+                 tf.zeros((bs, self.length-(t+2), self.words))], axis=-2)
             y_hat += pred
         return y_hat
     
@@ -117,13 +108,11 @@ class TextGen(BaseModel):
               optimizer='adam',
               lr_init=1e-4, 
               decay_every=250000,
-              g_updates=1, 
-              d_updates=0,
               clip_gradients=5.0,
               lambda_x=1,
               lambda_r=0.001,
               lambda_d=0,
-              lambda_m=0,
+              lambda_g=0,
               cnn_trainable=False,
               random_captions=True,
               n_read_threads=6,
@@ -185,32 +174,29 @@ class TextGen(BaseModel):
             print('creating optimizer')
 
             # get variables
-            D_vars = self.disc.trainable_variables
             G_vars = self.gen.trainable_variables
             if cnn_trainable:
                 G_vars += self.phi.trainable_variables
                 
-            # the generated caption
+            # generated caption given previous words
             y_hat = self.G(x_train, y_train)
             
-            # define loss terms:
-            # fake as fake, fake as real, and real as real
-            L_ff = self.L_adv(x_train, y_hat, 0)
-            L_fr = self.L_adv(x_train, y_hat, 1)            
-            L_rr = self.L_adv(x_train, y_train, 1)
+            # generated caption given only "start" token
+            y_hat_cont = self.sample_recursively(x_train, continuous=True)
             
-            # mismatch, xentropy, and weight regularizer
-            L_m = self.L_adv(x_train, tf.random_shuffle(y_train), 0)
+            # xentropy between real & generated next words
             L_x = self.xent(x_train, y_train)
+            
+            # weight regularizer
             L_r = self.weight_norm(G_vars)
-
-            # total discriminator loss
-            L_D = L_ff + L_rr + lambda_m*L_m
                 
-            # total generator loss
-            L_G = lambda_d*L_fr \
-                + lambda_x*L_x \
-                + lambda_r*L_r 
+            # xentropy plus weight regularizer
+            L_G = lambda_x*L_x + lambda_r*L_r 
+                
+            # gradient penalty from arxiv.org/abs/1606.02819
+            grad_norm = self.weight_norm(tf.gradients(L_G, G_vars))
+            if lambda_g:
+                L_G += lambda_g*grad_norm
                               
             # learning rate with periodic halving
             lr = lr_init*0.5**tf.floor(tf.cast(step, tf.float32)/decay_every)
@@ -218,57 +204,59 @@ class TextGen(BaseModel):
             # optimizer: one of {"adam", "sgd"}
             if optimizer == 'adam':
                 G_opt = tf.train.AdamOptimizer(lr, beta1=0.5)
-                if d_updates: D_opt = tf.train.AdamOptimizer(lr, beta1=0.5)\
-                                      .minimize(L_D, var_list=D_vars)
+                
             elif optimizer == 'sgd':
                 G_opt = tf.train.GradientDescentOptimizer(lr)
-                if d_updates: D_opt = tf.train.GradientDescentOptimizer(lr)\
-                                      .minimize(L_D, var_list=D_vars)
+                
             else:
                 raise ValueError, 'optimizer can be "adam" or "sgd"'
             
-            # rescale by L2 norm, if specified
+            # clip by L2 norm, if specified
             G_grad = G_opt.compute_gradients(L_G, var_list=G_vars)
             if clip_gradients:
                 G_grad = self.clip_gradients_by_norm(G_grad, clip_gradients)
             G_opt = G_opt.apply_gradients(G_grad)
+            
+            # batch norm EMA updates
+            if cnn_trainable:
+                x_in = layers.Input(tensor=x_train, shape=x_train.shape)
+                super(BaseModel, self).__init__(
+                    [x_in] + self.gen.inputs + self.disc.inputs,
+                    [self.phi(x_in)] + self.gen.outputs + self.disc.outputs)
+                G_opt = tf.group(G_opt, *self.updates)
 
         with tf.variable_scope('Summary'):
             print('creating summary')
             
-            # validation caption
+            # validation generated captions
             y_hat_val = self.G(x_val, y_val)
+            y_hat_cont_val = self.sample_recursively(x_val, continuous=True)
+            y_hat_samp_val = self.sample_recursively(x_val, continuous=False)
             
             # validation loss terms
-            L_ff_val = self.L_adv(x_val, y_hat_val, 0)
-            L_fr_val = self.L_adv(x_val, y_hat_val, 1)
-            L_rr_val = self.L_adv(x_val, y_val, 1)
-            L_m_val = self.L_adv(x_val, tf.random_shuffle(y_val), 0)
             L_x_val = self.xent(x_val, y_val)
-            L_D_val = L_ff_val + L_rr_val + lambda_m*L_m_val
-            L_G_val = lambda_d*L_fr_val \
-                    + lambda_x*L_x_val \
-                    + lambda_r*L_r 
+            L_G_val = lambda_x*L_x_val + lambda_r*L_r
+            
+            grad_norm_val = self.weight_norm(tf.gradients(L_G_val, G_vars))
+            if lambda_g:
+                L_G_val += lambda_g*grad_norm_val
             
             # decode predictions back to words
             table = self.create_table(inds_to_words_json)
             pred = self.sample_recursively(x_val)
             real_str = self.postproc_caption(y_val, table)[0]
-            fake_str = self.postproc_caption(pred, table)[0]
+            samp_str = self.postproc_caption(y_hat_samp_val, table)[0]
+            cont_str = self.postproc_caption(y_hat_cont_val, table)[0]
             txtfile = os.path.join(output_path, 'output.txt')
 
             # associate scalars with display names
             img_dict = {'x_val': x_val}
-            scalar_dict = {'L_ff': L_ff_val, 
-                           'L_fr': L_fr_val,
-                           'L_rr': L_rr_val,
-                           'L_m': L_m_val,
-                           'L_x': L_x_val,
-                           'L_D': L_D_val,
+            scalar_dict = {'L_x': L_x_val,
+                           'GN': grad_norm_val,
                            'L_G': L_G_val,
                            'L_r': L_r,
                            'SA': train_size, 
-                           'lr': lr}        
+                           'lr': lr}  
         # summarize 
         summary_op, summary_writer = self.make_summary(
             output_path, scalar_dict=scalar_dict, img_dict=img_dict)
@@ -312,24 +300,16 @@ class TextGen(BaseModel):
                             or train_stop.is_set() 
                             or val_stop.is_set()):
 
-                            # update discriminator
-                            for _ in range(d_updates):
-                                sess.run(D_opt, {learning: True})
-                            
                             # update generator  
-                            for _ in range(g_updates):
-                                sess.run(G_opt, {learning: True})
-                            
-                            # update global step
-                            n = sess.run(update_step)
-
+                            _, n = sess.run([G_opt, update_step], 
+                                            {learning: True})
                             # validate
                             if n % validate_every == 1:
-                                sm, rst, fst, lxv = sess.run(
-                                    [summary_op, real_str, fake_str, L_x_val],
-                                    {learning: False})
-                                st = 'Loss: {}\nReal: "{}"\nFake: "{}"\n'\
-                                     .format(lxv, rst, fst)\
+                                sm, rst, sst, cst, lxv = sess.run(
+                                    [summary_op, real_str, samp_str, 
+                                     cont_str, L_x_val], {learning: False})
+                                st = 'Loss: {}\nReal: "{}"\nSamp: "{}"\nCont: "{}"\n'\
+                                     .format(lxv, rst, sst, cst)\
                                      .replace('SOS ', '').replace(' EOS', '')
                                 print(st, file=open(txtfile, 'a'))
                                 summary_writer.add_summary(sm, n)
