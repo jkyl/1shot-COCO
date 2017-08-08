@@ -62,13 +62,17 @@ class TextGen(BaseModel):
         '''discriminator loss against real/fake labels'''
         return tf.reduce_mean(self.D(y))
         
-    def xent(self, x, y):
+    def xent(self, x, y, sparse=True):
         '''logistic loss between generated and real next words'''
         pred = self.G(x, y)
-        y_inds = tf.argmax(y, axis=-1)
-        labels = tf.concat([y_inds[:, 1:], y_inds[:, -1:]], axis=-1)
+        labels = tf.concat([y[:, 1:], y[:, -1:]], axis=1)
+        if sparse:
+            labels = tf.argmax(labels, axis=-1)
+            return tf.reduce_mean(
+                tf.nn.sparse_softmax_cross_entropy_with_logits(
+                    labels=labels, logits=pred))
         return tf.reduce_mean(
-            tf.nn.sparse_softmax_cross_entropy_with_logits(
+            tf.nn.softmax_cross_entropy_with_logits(
                 labels=labels, logits=pred))
     
     def weight_norm(self, weights):
@@ -103,6 +107,8 @@ class TextGen(BaseModel):
     def train(self, 
               train_record, 
               val_record,
+              base_record,
+              novel_record,
               output_path,
               batch_size=16,
               optimizer='adam',
@@ -112,10 +118,11 @@ class TextGen(BaseModel):
               lambda_x=1,
               lambda_r=0.001,
               lambda_g=0,
+              lambda_f=0,
               cnn_trainable=False,
               random_captions=True,
-              n_read_threads=6,
-              n_stage_threads=6,
+              n_read_threads=5,
+              n_stage_threads=5,
               capacity=16,
               epoch_size=10000,
               save_every=10000,
@@ -132,23 +139,29 @@ class TextGen(BaseModel):
             # coordinator for tf queues
             coord =  tf.train.Coordinator()
             
-            # read and preprocess training records
-            x_train, y_train, cls_train = self.read_tfrecord(
-                train_record, 
-                batch_size=batch_size, 
-                capacity=capacity, 
-                n_threads=n_read_threads)
+            # read and preprocess training record
+            x_train, y_train, cls_train = self.read_tfrecord(train_record, 
+                batch_size=batch_size, capacity=capacity, n_threads=n_read_threads)
             x_train = self.preproc_img(x_train)
             y_train, _ = self.preproc_caption(y_train, random=random_captions)
             
-            # read and preprocess validation records
-            x_val, y_val, cls_val = self.read_tfrecord(
-                val_record, 
-                batch_size=batch_size, 
-                capacity=1, 
-                n_threads=1)
+            # read and preprocess validation record
+            x_val, y_val, cls_val = self.read_tfrecord(val_record, 
+                batch_size=batch_size, capacity=1, n_threads=1)
             x_val = self.preproc_img(x_val)
             y_val, _ = self.preproc_caption(y_val, random=random_captions)
+            
+            # base classes
+            x_base, y_base, cls_base = self.read_tfrecord(base_record, 
+                batch_size=batch_size, capacity=1, n_threads=1)
+            x_base = self.preproc_img(x_base)
+            y_base, _ = self.preproc_caption(y_base, random=random_captions)
+            
+            # novel classes
+            x_novel, y_novel, cls_novel = self.read_tfrecord(novel_record, 
+                batch_size=batch_size, capacity=1, n_threads=1)
+            x_novel = self.preproc_img(x_novel)
+            y_novel, _ = self.preproc_caption(y_novel, random=random_captions)
         
         with tf.variable_scope('StagingArea'):
             print('creating staging area')
@@ -159,10 +172,10 @@ class TextGen(BaseModel):
             x_train, y_train = train_get
             
             # create validation queue on GPU
+            val_data = [x_val, y_val, x_base, y_base, x_novel, y_novel]
             val_get, val_size, val_put = self.stage_data(
-                [x_val, y_val], 
-                capacity=1)
-            x_val, y_val = val_get
+                val_data, capacity=1)
+            x_val, y_val, x_base, y_base, x_novel, y_novel = val_get
             
             # global step and learning phase flag
             step = tf.Variable(0, name='step')
@@ -184,13 +197,17 @@ class TextGen(BaseModel):
             y_hat_cont = self.sample_recursively(x_train, continuous=True)
             
             # xentropy between real & generated next words
-            L_x = self.xent(x_train, y_train)
+            L_x = self.xent(x_train, y_train, 
+                            sparse=(False if lambda_g else True))
             
             # weight regularizer
             L_r = self.weight_norm(G_vars)
+            
+            # feature vector regularizer
+            L_f = tf.reduce_mean(tf.reduce_sum(self.phi(x_train)**2, axis=-1))
                 
-            # xentropy plus weight regularizer
-            L_G = lambda_x*L_x + lambda_r*L_r 
+            # xentropy plus regularizers
+            L_G = lambda_x*L_x + lambda_r*L_r + lambda_f*L_f
                 
             # gradient penalty from arxiv.org/abs/1606.02819
             grad_norm = self.weight_norm(tf.gradients(L_G, G_vars))
@@ -229,36 +246,47 @@ class TextGen(BaseModel):
             
             # validation generated captions
             y_hat_val = self.G(x_val, y_val)
-            y_hat_cont_val = self.sample_recursively(x_val, continuous=True)
-            y_hat_samp_val = self.sample_recursively(x_val, continuous=False)
+            y_hat_base = self.G(x_base, y_base)
+            y_hat_novel = self.G(x_novel, y_novel)
+            y_hat_samp_base = self.sample_recursively(x_base, continuous=False)
+            y_hat_samp_novel = self.sample_recursively(x_novel, continuous=False)
             
-            # validation loss terms
-            L_x_val = self.xent(x_val, y_val)
-            L_G_val = lambda_x*L_x_val + lambda_r*L_r
-            
-            grad_norm_val = self.weight_norm(tf.gradients(L_G_val, G_vars))
-            if lambda_g:
-                L_G_val += lambda_g*grad_norm_val
-            
-            # decode predictions back to words
+            # decode predictions to words
             table = self.create_table(inds_to_words_json)
-            pred = self.sample_recursively(x_val)
-            real_str = self.postproc_caption(y_val, table)[0]
-            samp_str = self.postproc_caption(y_hat_samp_val, table)[0]
-            cont_str = self.postproc_caption(y_hat_cont_val, table)[0]
+            real_base = self.postproc_caption(y_base, table)[0]
+            real_novel = self.postproc_caption(y_novel, table)[0]
+            fake_base = self.postproc_caption(y_hat_samp_base, table)[0]
+            fake_novel = self.postproc_caption(y_hat_samp_novel, table)[0]
             txtfile = os.path.join(output_path, 'output.txt')
 
+            # validation loss terms
+            L_x_val = self.xent(x_val, y_val)
+            L_x_base = self.xent(x_base, y_base)
+            L_x_novel = self.xent(x_novel, y_novel)
+            L_f_val = tf.reduce_mean(tf.reduce_sum(self.phi(x_val)**2, axis=-1))
+            L_G_val = lambda_x*L_x_val + lambda_r*L_r + lambda_f*L_f
+            grad_norm_val = self.weight_norm(tf.gradients(L_G_val, G_vars))
+            if clip_gradients:
+                grad_norm_clipped = self.weight_norm(tf.clip_by_global_norm(
+                    tf.gradients(L_G_val, G_vars), clip_gradients)[0])
+            else:
+                 grad_norm_clipped = grad_norm_val 
+            if lambda_g:
+                L_G_val += lambda_g*grad_norm_val
+
             # associate scalars with display names
-            img_dict = {'x_val': x_val}
-            scalar_dict = {'L_x': L_x_val,
-                           'GN': grad_norm_val,
-                           'L_G': L_G_val,
+            scalar_dict = {'L_x_all': L_x_val,
+                           'L_x_base': L_x_base,
+                           'L_x_novel': L_x_novel,
+                           'L_G_tot': L_G_val,
                            'L_r': L_r,
+                           'GN': grad_norm_val,
+                           'GN_clipped': grad_norm_clipped,
                            'SA': train_size, 
                            'lr': lr}  
         # summarize 
         summary_op, summary_writer = self.make_summary(
-            output_path, scalar_dict=scalar_dict, img_dict=img_dict)
+            output_path, scalar_dict=scalar_dict)
 
         # start the session 
         with tf.Session(graph=self.graph) as sess:
@@ -304,11 +332,16 @@ class TextGen(BaseModel):
                                             {learning: True})
                             # validate
                             if n % validate_every == 1:
-                                sm, rst, sst, cst, lxv = sess.run(
-                                    [summary_op, real_str, samp_str, 
-                                     cont_str, L_x_val], {learning: False})
-                                st = 'Loss: {}\nReal: "{}"\nSamp: "{}"\nCont: "{}"\n'\
-                                     .format(lxv, rst, sst, cst)\
+                                sm, rb, fb, rn, fn, lxv = sess.run(
+                                    [summary_op, real_base, fake_base, 
+                                     real_novel, fake_novel, L_x_val], {learning: False})
+                                st = '\n'.join([
+                                        'Loss: {}',
+                                        'Real base: "{}"',
+                                        'Fake base: "{}"',
+                                        'Real novel: "{}"',
+                                        'Fake novel: "{}"\n'])\
+                                     .format(lxv, rb, fb, rn, fn)\
                                      .replace('SOS ', '').replace(' EOS', '')
                                 print(st, file=open(txtfile, 'a'))
                                 summary_writer.add_summary(sm, n)

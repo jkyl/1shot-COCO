@@ -70,11 +70,24 @@ def main(imgs_path, captions_json, classes_json, output_tfrecord,
         print('got classes')
         record = tf.python_io.TFRecordWriter(output_tfrecord)
         if lowshot_value:
-            novel_classes = set([ 1, 23, 15, 46, 42, 56, 72, 17, 
-                                 60, 14, 61, 32, 30, 35, 58, 67,  
-                                  8, 71, 40,  2, 64, 52, 24, 27, 
-                                 63,  5, 79, 21, 37, 74, 49, 70, 
-                                 53, 45, 65, 16, 75,  9, 41, 26])
+            fname = output_tfrecord.split('.')
+            base_fname = '.'.join([fname[0]+'_BASE', fname[1]])
+            novel_fname = '.'.join([fname[0]+'_NOVEL', fname[1]])
+            base_record = tf.python_io.TFRecordWriter(base_fname)
+            novel_record = tf.python_io.TFRecordWriter(novel_fname)
+            '''
+            novel classes:
+            --------------
+            dining table, parking meter, remote, apple, potted plant, vase, broccoli, 
+            spoon, keyboard, sports ball, hair drier, carrot, toilet, skateboard, 
+            suitcase, tennis racket, baseball glove, donut, teddy bear, tv, motorcycle, 
+            sandwich, bicycle, oven, toaster, car, cup, sheep, bed, refrigerator, tie, 
+            horse, cat, wine glass, backpack, dog, boat, mouse, knife, baseball bat
+            '''
+            novel_classes = set([67, 14, 75, 53, 64, 86, 56, 50, 76, 37, 
+                                 89, 57, 70, 41, 33, 43, 40, 60, 88, 72,  
+                                  4, 54,  2, 79, 80,  3, 47, 20, 65, 82, 
+                                 32, 19, 17, 46, 27, 18,  9, 74, 49, 39])
             novel_counts = dict(zip(list(novel_classes), [0]*40))
         print('starting')
         with tf.Session() as sess:
@@ -90,17 +103,25 @@ def main(imgs_path, captions_json, classes_json, output_tfrecord,
                         'caption': _bytes_feature(caption.tostring()),
                         'class': _int64_feature(class_)
                     }))
+                    serial = example.SerializeToString()
                     if lowshot_value: 
                         if class_ in novel_classes:
                             if novel_counts[class_] < lowshot_value:
                                 novel_counts[class_] += 1
-                                record.write(example.SerializeToString())
+                                record.write(serial)
+                            novel_record.write(serial)
                         else:
-                            record.write(example.SerializeToString())
+                            record.write(serial)
+                            base_record.write(serial)
                     else:
-                        record.write(example.SerializeToString())
+                        record.write(serial)
                 record.close()
+                if lowshot_value:
+                    novel_record.close()
+            
+                coord.request_stop()
             except:
+                coord.request_stop()
                 raise
     
 if __name__== '__main__':
@@ -111,9 +132,9 @@ if __name__== '__main__':
     p.add_argument('captions_json', type=str)
     p.add_argument('classes_json', type=str)
     p.add_argument('output_tfrecord', type=str)
-    p.add_argument('-lv', '--lowshot_value', type=int, default=None,
+    p.add_argument('-lv', '--lowshot_value', type=int, default=np.inf,
         help='number of images per novel class')
-    p.add_argument('-s', '--img_size', type=int, default=224,
+    p.add_argument('-s', '--img_size', type=int, default=299,
         help='sidelength of images')
     p.add_argument('-c', '--center_crop', type=bool, default=True,
         help='whether or not to perform a center crop before resize')
@@ -121,5 +142,3 @@ if __name__== '__main__':
         help='whether to truncate the total number of examples')
     d = p.parse_args().__dict__
     main(**d)
-        
-    
