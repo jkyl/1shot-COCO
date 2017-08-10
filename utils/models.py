@@ -43,7 +43,7 @@ class BaseModel(models.Model):
                     min_after_dequeue=0)
             return tf.train.batch(
                 [img, caption, class_], 
-                num_threads=n_threads
+                num_threads=n_threads,
                 batch_size=batch_size, 
                 capacity=batch_size*capacity)
 
