@@ -26,23 +26,25 @@ class BaseModel(models.Model):
                 'class': tf.FixedLenFeature([], tf.int64),
                 'image_size': tf.FixedLenFeature([], tf.int64),
                 'vocab_size': tf.FixedLenFeature([], tf.int64),
-                'length': tf.FixedLenFeature([], tf.int64)} 
+                'length': tf.FixedLenFeature([], tf.int64),
+                'image_id': tf.FixedLenFeature([], tf.int64)} 
             f = tf.parse_single_example(serialized_example, features=feature)
-            img, caption, class_ = f['image'], f['caption'], f['class']
+            img, caption, class_, id_ = f['image'], f['caption'], f['class'], f['image_id']
             img = tf.image.decode_jpeg(img)
             img.set_shape((self.img_size, self.img_size, 3))
             caption = tf.decode_raw(caption, tf.int64)
             caption.set_shape((7*self.length,))
             caption = tf.reshape(caption, (7, self.length))
             class_.set_shape([])
+            id_.set_shape([])
             if shuffle:
                 return tf.train.shuffle_batch_join(
-                    [[img, caption, class_]]*n_threads, 
+                    [[img, caption, class_, id_]]*n_threads, 
                     batch_size=batch_size, 
                     capacity=batch_size*capacity, 
                     min_after_dequeue=0)
             return tf.train.batch(
-                [img, caption, class_], 
+                [img, caption, class_, id_], 
                 num_threads=n_threads,
                 batch_size=batch_size, 
                 capacity=batch_size*capacity)
@@ -67,7 +69,7 @@ class BaseModel(models.Model):
                         if sess.run(size) < capacity:
                             sess.run(put_op)
                         else:
-                            time.sleep(0.01)
+                            time.sleep(0.1)
                     except:
                         stage_stop.set()
                         raise

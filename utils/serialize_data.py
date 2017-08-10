@@ -41,9 +41,9 @@ def read_imgs(img_files, size=224, center_crop=True):
     
 def read_captions(captions_json):
     j = json.loads(open(captions_json).read())
-    _, captions = zip(*sorted(j.items(), key=lambda x: int(x[0])))
+    ids, captions = zip(*sorted(j.items(), key=lambda x: int(x[0])))
     captions = np.array(captions)
-    return tf.train.input_producer(captions, shuffle=False).dequeue(), captions.max()+1, captions.shape[-1]
+    return tf.train.input_producer(captions, shuffle=False).dequeue(), captions.max()+1, captions.shape[-1], tf.train.input_producer([int(i) for i in ids], shuffle=False).dequeue()
 
 def read_classes(classes_json):
     j = json.loads(open(classes_json).read())
@@ -52,7 +52,7 @@ def read_classes(classes_json):
     return tf.train.input_producer(classes, shuffle=False).dequeue()
 
 def main(imgs_path, captions_json, classes_json, output_tfrecord, 
-         lowshot_value=None, img_size=299, center_crop=True, truncate=False):
+         lowshot_value=np.inf, img_size=299, center_crop=True, truncate=False):
     ''''''
     with tf.device('/CPU:0'):
         img_files = sorted(glob.glob(os.path.join(imgs_path, '*.jpg')))
@@ -64,7 +64,7 @@ def main(imgs_path, captions_json, classes_json, output_tfrecord,
         print('made coord')
         img_op = read_imgs(img_files, size=img_size, center_crop=center_crop)
         print('got img tensor')
-        caption_op, vocab_size, length = read_captions(captions_json)
+        caption_op, vocab_size, length, id_op = read_captions(captions_json)
         print('got captions')
         class_op = read_classes(classes_json)
         print('got classes')
@@ -95,14 +95,15 @@ def main(imgs_path, captions_json, classes_json, output_tfrecord,
             sess.graph.finalize()
             try:
                 for i in tqdm.trange(n):
-                    img, caption, class_ = sess.run([img_op, caption_op, class_op])
+                    img, caption, class_, id_ = sess.run([img_op, caption_op, class_op, id_op])
                     example = tf.train.Example(features=tf.train.Features(feature={
                         'image_size': _int64_feature(img_size),
                         'vocab_size': _int64_feature(vocab_size),
                         'length': _int64_feature(length),
                         'image': _bytes_feature(img),
                         'caption': _bytes_feature(caption.tostring()),
-                        'class': _int64_feature(class_)
+                        'class': _int64_feature(class_), 
+                        'image_id': _int64_feature(id_),
                     }))
                     serial = example.SerializeToString()
                     if lowshot_value: 

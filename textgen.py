@@ -140,25 +140,25 @@ class TextGen(BaseModel):
             coord =  tf.train.Coordinator()
             
             # read and preprocess training record
-            x_train, y_train, cls_train = self.read_tfrecord(train_record, 
+            x_train, y_train, cls_train, id_train = self.read_tfrecord(train_record, 
                 batch_size=batch_size, capacity=capacity*8, n_threads=n_read_threads)
             x_train = self.preproc_img(x_train)
             y_train, _ = self.preproc_caption(y_train, random=random_captions)
             
             # read and preprocess validation record
-            x_val, y_val, cls_val = self.read_tfrecord(val_record, 
+            x_val, y_val, cls_val, id_val = self.read_tfrecord(val_record, 
                 batch_size=batch_size, capacity=1, n_threads=1)
             x_val = self.preproc_img(x_val)
             y_val, _ = self.preproc_caption(y_val, random=random_captions)
             
             # base classes
-            x_base, y_base, cls_base = self.read_tfrecord(base_record, 
+            x_base, y_base, cls_base, id_base = self.read_tfrecord(base_record, 
                 batch_size=batch_size, capacity=1, n_threads=1)
             x_base = self.preproc_img(x_base)
             y_base, _ = self.preproc_caption(y_base, random=random_captions)
             
             # novel classes
-            x_novel, y_novel, cls_novel = self.read_tfrecord(novel_record, 
+            x_novel, y_novel, cls_novel, id_novel = self.read_tfrecord(novel_record, 
                 batch_size=batch_size, capacity=1, n_threads=1)
             x_novel = self.preproc_img(x_novel)
             y_novel, _ = self.preproc_caption(y_novel, random=random_captions)
