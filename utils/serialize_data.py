@@ -47,7 +47,7 @@ def read_captions(captions_json):
 
 def read_classes(classes_json):
     j = json.loads(open(classes_json).read())
-    d = {d['image_id']: int(d['category_id']) for d in j['annotations']}
+    d = {int(d['image_id']): int(d['category_id']) for d in j['annotations']}
     _, classes = zip(*sorted(d.items(), key=lambda x: int(x[0])))
     return tf.train.input_producer(classes, shuffle=False).dequeue()
 
@@ -92,6 +92,7 @@ def main(imgs_path, captions_json, classes_json, output_tfrecord,
         print('starting')
         with tf.Session() as sess:
             tf.train.start_queue_runners(sess=sess, coord=coord)
+            sess.graph.finalize()
             try:
                 for i in tqdm.trange(n):
                     img, caption, class_ = sess.run([img_op, caption_op, class_op])

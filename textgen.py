@@ -11,7 +11,7 @@ __author__ = 'Jonathan Kyl'
 class TextGen(BaseModel):
     def __init__(self, 
                  img_size=299, 
-                 code_dim=1024, 
+                 code_dim=512, 
                  length=20, 
                  words=9413, 
                  cnn_type='inception',
@@ -79,14 +79,14 @@ class TextGen(BaseModel):
         '''L2 weight regularizer'''
         return tf.reduce_sum([tf.reduce_sum(w**2) for w in weights])
 
-    def sample_recursively(self, x, continuous=False):
+    def sample_recursively(self, x, batch_size=1, continuous=False):
         ''''''
         # predict the first word given a "start" token
-        bs = tf.shape(x)[0]
+        x = x[:batch_size]
         y_hat = np.zeros((1, self.length, self.words))
         y_hat[:, 0, self.words-2] = 1
         y_hat = tf.convert_to_tensor(y_hat, dtype=tf.float32)
-        y_hat = tf.tile(y_hat, [bs, 1, 1])
+        y_hat = tf.tile(y_hat, [batch_size, 1, 1])
 
         # append most likely word given previous word(s) to next round's input
         for t in range(self.length-1):
@@ -99,8 +99,8 @@ class TextGen(BaseModel):
                 pred = tf.where(
                     tf.equal(g-m, 0), tf.ones_like(g), tf.zeros_like(g))
             pred = tf.concat(
-                [tf.zeros((bs, t+1, self.words)), pred[:, t:t+1], 
-                 tf.zeros((bs, self.length-(t+2), self.words))], axis=-2)
+                [tf.zeros((batch_size, t+1, self.words)), pred[:, t:t+1], 
+                 tf.zeros((batch_size, self.length-(t+2), self.words))], axis=-2)
             y_hat += pred
         return y_hat
     
@@ -141,7 +141,7 @@ class TextGen(BaseModel):
             
             # read and preprocess training record
             x_train, y_train, cls_train = self.read_tfrecord(train_record, 
-                batch_size=batch_size, capacity=capacity, n_threads=n_read_threads)
+                batch_size=batch_size, capacity=capacity*8, n_threads=n_read_threads)
             x_train = self.preproc_img(x_train)
             y_train, _ = self.preproc_caption(y_train, random=random_captions)
             
@@ -201,7 +201,7 @@ class TextGen(BaseModel):
                             sparse=(False if lambda_g else True))
             
             # weight regularizer
-            L_r = self.weight_norm(G_vars)
+            L_r = self.weight_norm(self.gen.trainable_variables)
             
             # feature vector regularizer
             L_f = tf.reduce_mean(tf.reduce_sum(self.phi(x_train)**2, axis=-1))
@@ -232,14 +232,6 @@ class TextGen(BaseModel):
             if clip_gradients:
                 G_grad = self.clip_gradients_by_norm(G_grad, clip_gradients)
             G_opt = G_opt.apply_gradients(G_grad)
-            
-            # batch norm EMA updates
-            if cnn_trainable:
-                x_in = layers.Input(tensor=x_train, shape=x_train.shape)
-                super(BaseModel, self).__init__(
-                    [x_in] + self.gen.inputs + self.disc.inputs,
-                    [self.phi(x_in)] + self.gen.outputs + self.disc.outputs)
-                G_opt = tf.group(G_opt, *self.updates)
 
         with tf.variable_scope('Summary'):
             print('creating summary')
@@ -275,10 +267,12 @@ class TextGen(BaseModel):
                 L_G_val += lambda_g*grad_norm_val
 
             # associate scalars with display names
-            scalar_dict = {'L_x_all': L_x_val,
+            scalar_dict = {'L_x_train': L_x, 
+                           'L_x_val': L_x_val,
                            'L_x_base': L_x_base,
                            'L_x_novel': L_x_novel,
                            'L_G_tot': L_G_val,
+                           'L_f': L_f_val,
                            'L_r': L_r,
                            'GN': grad_norm_val,
                            'GN_clipped': grad_norm_clipped,
@@ -294,9 +288,11 @@ class TextGen(BaseModel):
             print('starting threads')
             tf.train.start_queue_runners(sess=sess, coord=coord)
             train_stop, train_threads = self.start_threads(
-                sess, train_put, n_stage_threads=n_stage_threads)
+                sess, train_put, train_size, capacity, 
+                n_stage_threads=n_stage_threads)
             val_stop, val_threads = self.start_threads(
-                sess, val_put, n_stage_threads=1)
+                sess, val_put, val_size, capacity=1,
+                n_stage_threads=1)
             
             print('initializing variables')
             sess.run(tf.global_variables_initializer())
@@ -312,6 +308,14 @@ class TextGen(BaseModel):
             elif cnn_ckpt:
                 print('loading cnn weights from '+cnn_ckpt)
                 self.phi.load_weights(cnn_ckpt)
+                
+            # batch norm EMA updates
+            if cnn_trainable:
+                _x = layers.Input(tensor=x_train, shape=x_train.shape)
+                super(BaseModel, self).__init__(
+                    [_x] + self.gen.inputs,
+                    [self.phi(_x)] + self.gen.outputs)
+                G_opt = tf.group(G_opt, *self.updates)
                 
             print('finalizing graph')
             self.graph.finalize()
