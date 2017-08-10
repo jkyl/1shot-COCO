@@ -13,7 +13,7 @@ __author__ = 'Jonathan Kyl'
 class BaseModel(models.Model):
     ''''''
     def read_tfrecord(self, tfrecord, batch_size=64, capacity=8, 
-                      n_threads=4, n_epochs=None):
+                      n_threads=4, n_epochs=None, shuffle=True):
         ''''''
         with tf.device('/cpu:0'):
             reader = tf.TFRecordReader()
@@ -35,7 +35,13 @@ class BaseModel(models.Model):
             caption.set_shape((7*self.length,))
             caption = tf.reshape(caption, (7, self.length))
             class_.set_shape([])
-            return tf.train.shuffle_batch_join(
+            if shuffle:
+                return tf.train.shuffle_batch_join(
+                    [[img, caption, class_]]*n_threads, 
+                    batch_size=batch_size, 
+                    capacity=batch_size*capacity, 
+                    min_after_dequeue=0)
+            return tf.train.batch_join(
                 [[img, caption, class_]]*n_threads, 
                 batch_size=batch_size, 
                 capacity=batch_size*capacity, 
@@ -49,7 +55,8 @@ class BaseModel(models.Model):
             SA = StagingArea(dtypes, shapes=shapes, capacity=capacity)
             return SA.get(), SA.size(), SA.put(batch)
     
-    def start_threads(self, sess, put_op, n_stage_threads=4):
+    def start_threads(self, sess, put_op, size, capacity, 
+                      n_stage_threads=4):
         ''''''        
         stage_threads = []
         stage_stop = threading.Event()
@@ -57,7 +64,10 @@ class BaseModel(models.Model):
             with sess.graph.as_default():
                 while not stage_stop.is_set():
                     try:
-                        sess.run(put_op)
+                        if sess.run(size) < capacity:
+                            sess.run(put_op)
+                        else:
+                            time.sleep(0.01)
                     except:
                         stage_stop.set()
                         raise
