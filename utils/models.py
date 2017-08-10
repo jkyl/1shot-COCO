@@ -41,11 +41,11 @@ class BaseModel(models.Model):
                     batch_size=batch_size, 
                     capacity=batch_size*capacity, 
                     min_after_dequeue=0)
-            return tf.train.batch_join(
-                [[img, caption, class_]]*n_threads, 
+            return tf.train.batch(
+                [img, caption, class_], 
+                num_threads=n_threads
                 batch_size=batch_size, 
-                capacity=batch_size*capacity, 
-                min_after_dequeue=0)
+                capacity=batch_size*capacity)
 
     def stage_data(self, batch, capacity=8):
         ''''''
