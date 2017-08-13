@@ -1,10 +1,12 @@
 from __future__ import division, print_function
 import os
+import sys
 import json
 import time
 import threading
 import numpy as np
 import tensorflow as tf
+from tensorflow.contrib.data import Dataset
 from tensorflow.contrib.staging import StagingArea
 from tensorflow.contrib.keras import layers, models, backend, applications
 
@@ -27,7 +29,8 @@ class BaseModel(models.Model):
                 'image_size': tf.FixedLenFeature([], tf.int64),
                 'vocab_size': tf.FixedLenFeature([], tf.int64),
                 'length': tf.FixedLenFeature([], tf.int64),
-                'image_id': tf.FixedLenFeature([], tf.int64)} 
+                'image_id': tf.FixedLenFeature([], tf.int64)
+            } 
             f = tf.parse_single_example(serialized_example, features=feature)
             img, caption, class_, id_ = f['image'], f['caption'], f['class'], f['image_id']
             img = tf.image.decode_jpeg(img)
@@ -49,40 +52,17 @@ class BaseModel(models.Model):
                 batch_size=batch_size, 
                 capacity=batch_size*capacity)
 
-    def stage_data(self, batch, capacity=8):
+    def stage_data(self, batch, capacity=8, n_threads=4):
         ''''''
         with tf.device('/gpu:0'):
             dtypes = [t.dtype for t in batch]
             shapes = [t.get_shape() for t in batch]
-            SA = StagingArea(dtypes, shapes=shapes, capacity=capacity)
-            return SA.get(), SA.size(), SA.put(batch)
-    
-    def start_threads(self, sess, put_op, size, capacity, 
-                      n_stage_threads=4):
-        ''''''        
-        stage_threads = []
-        stage_stop = threading.Event()
-        def threads_job():
-            with sess.graph.as_default():
-                while not stage_stop.is_set():
-                    try:
-                        if sess.run(size) < capacity:
-                            sess.run(put_op)
-                        else:
-                            time.sleep(0.1)
-                    except:
-                        stage_stop.set()
-                        raise
-        try:
-            for i in range(n_stage_threads):
-                thread = threading.Thread(target=threads_job)
-                stage_threads.append(thread)
-                thread.daemon = True
-                thread.start()
-        except:
-            stage_stop.set()
-            raise
-        return stage_stop, stage_threads
+            SA = StagingArea(dtypes, shapes=shapes, memory_limit=1e9)
+            get, size, put = SA.get(), SA.size(), SA.put(batch)
+        qr = tf.train.QueueRunner(queue=SA, enqueue_ops=[put]*n_threads, 
+                                  close_op=tf.no_op(), cancel_op=tf.no_op())
+        tf.train.add_queue_runner(qr)
+        return get
 
     def make_summary(self, output_path, img_dict={},
                      scalar_dict={}, text_dict={}, n_images=1):

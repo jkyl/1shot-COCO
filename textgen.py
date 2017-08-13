@@ -141,7 +141,7 @@ class TextGen(BaseModel):
             
             # read and preprocess training record
             x_train, y_train, cls_train, id_train = self.read_tfrecord(train_record, 
-                batch_size=batch_size, capacity=capacity*8, n_threads=n_read_threads)
+                batch_size=batch_size, capacity=capacity, n_threads=n_read_threads)
             x_train = self.preproc_img(x_train)
             y_train, _ = self.preproc_caption(y_train, random=random_captions)
             
@@ -167,15 +167,13 @@ class TextGen(BaseModel):
             print('creating staging area')
 
             # create training queue on GPU
-            train_get, train_size, train_put = self.stage_data(
-                [x_train, y_train], capacity=capacity)
-            x_train, y_train = train_get
+            x_train, y_train = self.stage_data([x_train, y_train], 
+                capacity=capacity, n_threads=n_stage_threads)
             
             # create validation queue on GPU
-            val_data = [x_val, y_val, x_base, y_base, x_novel, y_novel]
-            val_get, val_size, val_put = self.stage_data(
-                val_data, capacity=1)
-            x_val, y_val, x_base, y_base, x_novel, y_novel = val_get
+            x_val, y_val, x_base, y_base, x_novel, y_novel = self.stage_data(
+                [x_val, y_val, x_base, y_base, x_novel, y_novel], 
+                    capacity=1, n_threads=1)
             
             # global step and learning phase flag
             step = tf.Variable(0, name='step')
@@ -237,19 +235,19 @@ class TextGen(BaseModel):
             print('creating summary')
             
             # validation generated captions
-            y_hat_val = self.G(x_val, y_val)
-            y_hat_base = self.G(x_base, y_base)
-            y_hat_novel = self.G(x_novel, y_novel)
-            y_hat_samp_base = self.sample_recursively(x_base, continuous=False)
-            y_hat_samp_novel = self.sample_recursively(x_novel, continuous=False)
+            #y_hat_val = self.G(x_val, y_val)
+            #y_hat_base = self.G(x_base, y_base)
+            #y_hat_novel = self.G(x_novel, y_novel)
+            #y_hat_samp_base = self.sample_recursively(x_base, continuous=False)
+            #y_hat_samp_novel = self.sample_recursively(x_novel, continuous=False)
             
             # decode predictions to words
-            table = self.create_table(inds_to_words_json)
-            real_base = self.postproc_caption(y_base, table)[0]
-            real_novel = self.postproc_caption(y_novel, table)[0]
-            fake_base = self.postproc_caption(y_hat_samp_base, table)[0]
-            fake_novel = self.postproc_caption(y_hat_samp_novel, table)[0]
-            txtfile = os.path.join(output_path, 'output.txt')
+            #table = self.create_table(inds_to_words_json)
+            #real_base = self.postproc_caption(y_base, table)[0]
+            #real_novel = self.postproc_caption(y_novel, table)[0]
+            #fake_base = self.postproc_caption(y_hat_samp_base, table)[0]
+            #fake_novel = self.postproc_caption(y_hat_samp_novel, table)[0]
+            #txtfile = os.path.join(output_path, 'output.txt')
 
             # validation loss terms
             L_x_val = self.xent(x_val, y_val)
@@ -276,7 +274,6 @@ class TextGen(BaseModel):
                            'L_r': L_r,
                            'GN': grad_norm_val,
                            'GN_clipped': grad_norm_clipped,
-                           'SA': train_size, 
                            'lr': lr}  
         # summarize 
         summary_op, summary_writer = self.make_summary(
@@ -284,15 +281,6 @@ class TextGen(BaseModel):
 
         # start the session 
         with tf.Session(graph=self.graph) as sess:
-            
-            print('starting threads')
-            tf.train.start_queue_runners(sess=sess, coord=coord)
-            train_stop, train_threads = self.start_threads(
-                sess, train_put, train_size, capacity, 
-                n_stage_threads=n_stage_threads)
-            val_stop, val_threads = self.start_threads(
-                sess, val_put, val_size, capacity=1,
-                n_stage_threads=1)
             
             print('initializing variables')
             sess.run(tf.global_variables_initializer())
@@ -308,6 +296,9 @@ class TextGen(BaseModel):
             elif cnn_ckpt:
                 print('loading cnn weights from '+cnn_ckpt)
                 self.phi.load_weights(cnn_ckpt)
+                
+            print('starting threads')
+            tf.train.start_queue_runners(sess=sess, coord=coord)
                 
             # batch norm EMA updates
             if cnn_trainable:
@@ -327,27 +318,26 @@ class TextGen(BaseModel):
                     for _ in tqdm.trange(epoch_size, disable=False):
 
                         # check for dead threads
-                        if not (coord.should_stop() 
-                            or train_stop.is_set() 
-                            or val_stop.is_set()):
+                        if not coord.should_stop():
 
                             # update generator  
                             _, n = sess.run([G_opt, update_step], 
                                             {learning: True})
                             # validate
                             if n % validate_every == 1:
-                                sm, rb, fb, rn, fn, lxv = sess.run(
-                                    [summary_op, real_base, fake_base, 
-                                     real_novel, fake_novel, L_x_val], {learning: False})
-                                st = '\n'.join([
-                                        'Loss: {}',
-                                        'Real base: "{}"',
-                                        'Fake base: "{}"',
-                                        'Real novel: "{}"',
-                                        'Fake novel: "{}"\n'])\
-                                     .format(lxv, rb, fb, rn, fn)\
-                                     .replace('SOS ', '').replace(' EOS', '')
-                                print(st, file=open(txtfile, 'a'))
+                                sm = sess.run(summary_op, {learning: False})
+                                #sm, rb, fb, rn, fn, lxv = sess.run(
+                                #    [summary_op, real_base, fake_base, 
+                                #     real_novel, fake_novel, L_x_val], {learning: False})
+                                #st = '\n'.join([
+                                #        'Loss: {}',
+                                #        'Real base: "{}"',
+                                #        'Fake base: "{}"',
+                                #        'Real novel: "{}"',
+                                #        'Fake novel: "{}"\n'])\
+                                #     .format(lxv, rb, fb, rn, fn)\
+                                #     .replace('SOS ', '').replace(' EOS', '')
+                                #print(st, file=open(txtfile, 'a'))
                                 summary_writer.add_summary(sm, n)
                                 summary_writer.flush()
 
@@ -361,8 +351,6 @@ class TextGen(BaseModel):
             # them to recieve message before exiting session context
             except:
                 coord.request_stop()
-                train_stop.set()
-                val_stop.set()
                 time.sleep(0.2)
                 raise
                 

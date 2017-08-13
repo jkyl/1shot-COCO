@@ -6,6 +6,16 @@ import json
 import tqdm
 import os
 
+def write_dict(d, e, i, n):
+    for k, v in e.items():
+        try:
+            d[k][i] = v
+        except KeyError:
+            shape = [n] + list(v.shape)
+            dtype = 'int32' if k in ('caption', 'image_id') else 'uint8'
+            d[k] = np.zeros(shape, dtype=dtype)
+            d[k][i] = v
+
 def crop_to_aspect_ratio(img):
     ''''''
     shape = tf.shape(img)
@@ -28,7 +38,7 @@ def _bytes_feature(value):
     return tf.train.Feature(
         bytes_list=tf.train.BytesList(value=[value]))
 
-def read_imgs(img_files, size=224, center_crop=True):
+def read_imgs(img_files, size=224, center_crop=True, encode=True):
     t_files = tf.train.string_input_producer(img_files, shuffle=False)
     reader = tf.WholeFileReader()
     _, img_bytes = reader.read(t_files)
@@ -36,8 +46,9 @@ def read_imgs(img_files, size=224, center_crop=True):
     if center_crop:
         img = crop_to_aspect_ratio(img)
     rs = resize_lanczos(img, (size, size))
-    img_bytes = tf.image.encode_jpeg(rs)
-    return img_bytes
+    if encode:
+        return tf.image.encode_jpeg(rs)
+    return rs
     
 def read_captions(captions_json):
     j = json.loads(open(captions_json).read())
@@ -51,7 +62,7 @@ def read_classes(classes_json):
     _, classes = zip(*sorted(d.items(), key=lambda x: int(x[0])))
     return tf.train.input_producer(classes, shuffle=False).dequeue()
 
-def main(imgs_path, captions_json, classes_json, output_tfrecord, 
+def main(imgs_path, captions_json, classes_json, output_file, numpy=False,
          lowshot_value=np.inf, img_size=299, center_crop=True, truncate=False):
     ''''''
     with tf.device('/CPU:0'):
@@ -62,19 +73,26 @@ def main(imgs_path, captions_json, classes_json, output_tfrecord,
         print('found {} images'.format(n))
         coord = tf.train.Coordinator()
         print('made coord')
-        img_op = read_imgs(img_files, size=img_size, center_crop=center_crop)
+        img_op = read_imgs(img_files, size=img_size, center_crop=center_crop, encode=not numpy)
         print('got img tensor')
         caption_op, vocab_size, length, id_op = read_captions(captions_json)
         print('got captions')
         class_op = read_classes(classes_json)
         print('got classes')
-        record = tf.python_io.TFRecordWriter(output_tfrecord)
+        if not numpy:
+            record = tf.python_io.TFRecordWriter(output_file)
+        else:
+            record = {}
         if lowshot_value:
-            fname = output_tfrecord.split('.')
+            fname = output_file.split('.')
             base_fname = '.'.join([fname[0]+'_BASE', fname[1]])
             novel_fname = '.'.join([fname[0]+'_NOVEL', fname[1]])
-            base_record = tf.python_io.TFRecordWriter(base_fname)
-            novel_record = tf.python_io.TFRecordWriter(novel_fname)
+            if not numpy:
+                base_record = tf.python_io.TFRecordWriter(base_fname)
+                novel_record = tf.python_io.TFRecordWriter(novel_fname)
+            else:
+                base_record = {}
+                novel_record = {}
             '''
             novel classes:
             --------------
@@ -92,36 +110,63 @@ def main(imgs_path, captions_json, classes_json, output_tfrecord,
         print('starting')
         with tf.Session() as sess:
             tf.train.start_queue_runners(sess=sess, coord=coord)
-            sess.graph.finalize()
             try:
                 for i in tqdm.trange(n):
                     img, caption, class_, id_ = sess.run([img_op, caption_op, class_op, id_op])
-                    example = tf.train.Example(features=tf.train.Features(feature={
-                        'image_size': _int64_feature(img_size),
-                        'vocab_size': _int64_feature(vocab_size),
-                        'length': _int64_feature(length),
-                        'image': _bytes_feature(img),
-                        'caption': _bytes_feature(caption.tostring()),
-                        'class': _int64_feature(class_), 
-                        'image_id': _int64_feature(id_),
-                    }))
-                    serial = example.SerializeToString()
+                    if not numpy:
+                        example = tf.train.Example(features=tf.train.Features(feature={
+                            'image_size': _int64_feature(img_size),
+                            'vocab_size': _int64_feature(vocab_size),
+                            'length': _int64_feature(length),
+                            'image': _bytes_feature(img),
+                            'caption': _bytes_feature(caption.tostring()),
+                            'class': _int64_feature(class_), 
+                            'image_id': _int64_feature(id_),
+                        }))
+                        serial = example.SerializeToString()
+                    else:
+                        example = {'image': img, 
+                                   'caption': caption, 
+                                   'class': class_, 
+                                   'image_id': id_}
                     if lowshot_value: 
                         if class_ in novel_classes:
                             if novel_counts[class_] < lowshot_value:
                                 novel_counts[class_] += 1
-                                record.write(serial)
-                            novel_record.write(serial)
+                                if not numpy:
+                                    record.write(serial)
+                                else:
+                                    write_dict(record, example, i, n)
+                            if not numpy:
+                                novel_record.write(serial)
+                            else:
+                                write_dict(novel_record, example, i, n)
                         else:
-                            record.write(serial)
-                            base_record.write(serial)
+                            if not numpy:
+                                record.write(serial)
+                                base_record.write(serial)
+                            else:
+                                write_dict(record, example, i, n)
+                                write_dict(base_record, example, i, n)
                     else:
-                        record.write(serial)
-                record.close()
-                if lowshot_value:
-                    novel_record.close()
-            
+                        if not numpy:
+                            record.write(serial)
+                        else:
+                            write_dict(record, example, i, n)
+                
                 coord.request_stop()
+                if not numpy:
+                    record.close()
+                    if lowshot_value:
+                        novel_record.close()
+                        base_record.close()
+                else:
+                    np.savez(output_file, **record)
+                    if lowshot_value:
+                        np.savez(base_fname, **base_record)
+                        np.savez(novel_fname, **novel_record)
+                        
+                
             except:
                 coord.request_stop()
                 raise
@@ -133,7 +178,7 @@ if __name__== '__main__':
     p.add_argument('imgs_path', type=str)
     p.add_argument('captions_json', type=str)
     p.add_argument('classes_json', type=str)
-    p.add_argument('output_tfrecord', type=str)
+    p.add_argument('output_file', type=str)
     p.add_argument('-lv', '--lowshot_value', type=int, default=np.inf,
         help='number of images per novel class')
     p.add_argument('-s', '--img_size', type=int, default=299,
