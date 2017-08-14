@@ -40,6 +40,8 @@ class BaseModel(models.Model):
             caption = tf.reshape(caption, (7, self.length))
             class_.set_shape([])
             id_.set_shape([])
+            img = self.preproc_img(img)
+            caption = self.preproc_caption(caption)[0]
             if shuffle:
                 return tf.train.shuffle_batch_join(
                     [[img, caption, class_, id_]]*n_threads, 
@@ -52,16 +54,16 @@ class BaseModel(models.Model):
                 batch_size=batch_size, 
                 capacity=batch_size*capacity)
 
-    def stage_data(self, batch, capacity=8, n_threads=4):
+    def stage_data(self, batch, memory_gb=1, n_threads=4):
         ''''''
         with tf.device('/gpu:0'):
             dtypes = [t.dtype for t in batch]
             shapes = [t.get_shape() for t in batch]
-            SA = StagingArea(dtypes, shapes=shapes, memory_limit=1e9)
-            get, size, put = SA.get(), SA.size(), SA.put(batch)
-        qr = tf.train.QueueRunner(queue=SA, enqueue_ops=[put]*n_threads, 
-                                  close_op=tf.no_op(), cancel_op=tf.no_op())
-        tf.train.add_queue_runner(qr)
+            SA = StagingArea(dtypes, shapes=shapes, memory_limit=memory_gb*1e9)
+            get, put, clear = SA.get(), SA.put(batch), SA.clear()
+        tf.train.add_queue_runner(
+            tf.train.QueueRunner(queue=SA, enqueue_ops=[put]*n_threads, 
+                                 close_op=clear, cancel_op=clear))
         return get
 
     def make_summary(self, output_path, img_dict={},
@@ -74,7 +76,7 @@ class BaseModel(models.Model):
             summaries.append(tf.summary.scalar(k, v))
         for k, v in text_dict.items():
             summaries.append(tf.summary.text(k, v))
-        summary_op = tf.summary.merge(summaries)
+        summary_op = tf.summary.merge_all()
         summary_writer = tf.summary.FileWriter(
             output_path, graph=self.graph)
         return summary_op, summary_writer
@@ -120,11 +122,13 @@ class BaseModel(models.Model):
             cap = per_batch_inds(cap, minus_ones=False)
             return tf.one_hot(cap, depth=self.words)
         
+        if len(caption.get_shape().as_list()) < 3:
+            caption = tf.expand_dims(caption, 0)
         inds_mapped = tf.map_fn(per_batch_inds, caption, dtype=tf.int64)
         onehots_mapped = tf.map_fn(per_batch_onehots, caption, dtype=tf.float32)
         inds_mapped.set_shape((None, self.length))
         onehots_mapped.set_shape((None, self.length, self.words))
-        return onehots_mapped, inds_mapped
+        return tf.squeeze(onehots_mapped), tf.squeeze(inds_mapped)
     
     def create_table(self, inds_to_words_json):
         ''''''
@@ -184,8 +188,8 @@ def rnn_discriminator(sequence_dim, length, code_dim, kind='LSTM'):
     else:
         raise ValueError, 'no such RNN method "{}"'.format(kind)
     sequence = layers.Input((length, sequence_dim))
-    emb = rnn(code_dim, recurrent_dropout=0.5, unroll=True,
+    sequence_emb = layers.Conv1D(code_dim, 1)(sequence)
+    out = rnn(1, recurrent_dropout=0.5, unroll=True,
               return_sequences=False, activation='linear')(sequence)
-    out = layers.Dense(1)(emb)
     return models.Model(sequence, out)
 
