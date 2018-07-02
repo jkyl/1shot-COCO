@@ -1,6 +1,6 @@
-# TextGen
+# 1shot-COCO
   
-TextGen is an image captioning neural network designed for 1-shot learning. This
+1shot-COCO is an image captioning neural network designed for 1-shot learning. This
 repository contains code for training and validating the TensorFlow model, as well
 as serializing the MS-COCO dataset into TFRecord files
 
